@@ -1,0 +1,43 @@
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+bin/
+gen/
+out/
+release/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin
+*.class
+
+# macOS
+.DS_Store
+
+# Backend Python
+backend_v2/venv/
+backend_v2/__pycache__/
+backend_v2/**/__pycache__/
+backend_v2/*.pyc
+backend_v2/.env
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets
+*.keystore
+*.jks
+secrets.properties
