@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import java.util.UUID
 import javax.inject.Inject
@@ -310,6 +311,36 @@ class UnifiedChatViewModel @Inject constructor(
      */
     fun clearNavigateToCallSummary() {
         _navigateToCallSummary.value = false
+    }
+
+    /**
+     * Trigger navigation to CallSummary.
+     * Used by UI when Continue is clicked for direct-phone agents (e.g., SICK_CALLER).
+     */
+    fun triggerNavigateToCallSummary() {
+        Log.i(TAG, "triggerNavigateToCallSummary: navigating to CallSummary")
+        _navigateToCallSummary.value = true
+    }
+
+    /**
+     * FIX 2: Inject a slot value locally (client-side).
+     * Used when user selects a CHOICE to ensure the field is persisted immediately,
+     * rather than relying on backend extractedData which can be unreliable.
+     */
+    fun injectSlot(key: String, value: String) {
+        if (key.isBlank()) return
+
+        val patch = buildJsonObject {
+            put(key, JsonPrimitive(value))
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                slots = mergeSlots(current.slots, patch)
+            )
+        }
+
+        Log.d(TAG, "injectSlot: $key=$value (local)")
     }
 
     /**

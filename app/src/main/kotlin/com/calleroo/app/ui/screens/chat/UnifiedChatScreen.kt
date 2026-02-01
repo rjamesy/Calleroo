@@ -55,6 +55,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -75,6 +76,7 @@ import com.calleroo.app.domain.model.ResolvedPlace
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
 import com.calleroo.app.util.PhoneUtils
 import com.calleroo.app.util.UnifiedConversationGuard
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.serialization.json.jsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -94,16 +96,20 @@ fun UnifiedChatScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
 
-    // Initialize on first composition
-    LaunchedEffect(conversationId) {
-        // Initialize task session with conversation params
-        taskSession.initSession(conversationId, agentType)
-        viewModel.initialize(agentType, conversationId)
+    // ✅ FIX 1: Only init session ONCE per conversation (don't wipe slots on recomposition)
+    LaunchedEffect(Unit) {
+        if (taskSession.conversationId != conversationId) {
+            taskSession.initSession(conversationId, agentType)
+            viewModel.initialize(agentType, conversationId)
+        }
     }
 
-    // Update task session slots whenever they change
-    LaunchedEffect(uiState.slots) {
-        taskSession.updateSlots(uiState.slots)
+    // ✅ FIX 2: Continuous slot sync (no missed updates under load)
+    LaunchedEffect(Unit) {
+        snapshotFlow { uiState.slots }
+            .collectLatest { slots ->
+                taskSession.updateSlots(slots)
+            }
     }
 
     // Auto-scroll to bottom when new messages arrive
@@ -127,7 +133,6 @@ fun UnifiedChatScreen(
             val params = uiState.placeSearchParams
             if (params != null) {
                 viewModel.clearPlaceSearchParams()
-                // Use defensive defaults - empty query/area will be handled by PlaceSearchViewModel
                 val safeQuery = params.query.ifBlank { "business" }
                 val safeArea = params.area.ifBlank { "Australia" }
                 onNavigateToPlaceSearch(safeQuery, safeArea)
@@ -149,22 +154,17 @@ fun UnifiedChatScreen(
         if (navigateToCallSummary) {
             viewModel.clearNavigateToCallSummary()
 
-            // For SICK_CALLER (and other direct-phone agents), we need to synthesize
-            // a ResolvedPlace from the slots since there's no PlaceSearch step
             if (agentType == AgentType.SICK_CALLER) {
                 val slots = uiState.slots
 
-                // Extract employer_name and employer_phone from slots
                 val employerName = slots["employer_name"]?.jsonPrimitive?.content
                     ?.takeIf { it.isNotBlank() }
                     ?: "Work"
-                val rawPhone = slots["employer_phone"]?.jsonPrimitive?.content ?: ""
 
-                // Convert phone to E.164 format
+                val rawPhone = slots["employer_phone"]?.jsonPrimitive?.content ?: ""
                 val phoneE164 = PhoneUtils.toE164(rawPhone)
 
                 if (phoneE164 != null) {
-                    // Synthesize ResolvedPlace for CallSummary
                     val manualPlace = ResolvedPlace(
                         placeId = "manual:sick_caller:${conversationId}",
                         businessName = employerName,
@@ -174,13 +174,11 @@ fun UnifiedChatScreen(
                     taskSession.setResolvedPlace(manualPlace)
                     onNavigateToCallSummary()
                 } else {
-                    // Phone parsing failed - show error and stay on chat
                     snackbarHostState.showSnackbar(
                         "Invalid phone number. Please check the employer phone and try again."
                     )
                 }
             } else {
-                // For other agents, just navigate (CallSummary will handle missing place)
                 onNavigateToCallSummary()
             }
         }
@@ -225,7 +223,6 @@ fun UnifiedChatScreen(
                 .imePadding()
                 .navigationBarsPadding()
         ) {
-            // Chat messages list
             LazyColumn(
                 state = listState,
                 modifier = Modifier
@@ -238,15 +235,11 @@ fun UnifiedChatScreen(
                     ChatBubble(message = message)
                 }
 
-                // Loading indicator
                 if (uiState.isLoading) {
-                    item {
-                        LoadingIndicator()
-                    }
+                    item { LoadingIndicator() }
                 }
             }
 
-            // Confirmation card (when backend returns CONFIRM)
             uiState.confirmationCard?.let { card ->
                 if (uiState.showConfirmationCard || uiState.isConfirmationSubmitting) {
                     ConfirmationCardUi(
@@ -259,18 +252,24 @@ fun UnifiedChatScreen(
                 }
             }
 
-            // Complete state - show Continue button
             if (uiState.showContinueButton) {
                 ContinueButton(
-                    onClick = { viewModel.handleContinue() }
+                    onClick = {
+                        // FIX 3: Handle SICK_CALLER directly (no PlaceSearch step)
+                        if (agentType == AgentType.SICK_CALLER) {
+                            // Sync slots before navigation
+                            taskSession.updateSlots(uiState.slots)
+                            viewModel.triggerNavigateToCallSummary()
+                        } else {
+                            viewModel.handleContinue()
+                        }
+                    }
                 )
             }
 
-            // Choice chips (ONLY when backend sends them)
             val currentQuestion = uiState.currentQuestion
             val choices = currentQuestion?.choices
             if (!choices.isNullOrEmpty() && !uiState.showConfirmationCard && !uiState.showContinueButton) {
-                // CRITICAL: Validate choices come from backend
                 UnifiedConversationGuard.assertChoicesFromBackend(
                     choices = choices,
                     backendProvided = true
@@ -278,27 +277,38 @@ fun UnifiedChatScreen(
 
                 ChoiceChips(
                     choices = choices,
-                    onChoiceSelected = { choice -> viewModel.sendMessage(choice.value) },
+                    onChoiceSelected = { choice ->
+                        // FIX 1: Persist CHOICE locally before sending to backend
+                        // This ensures slots like reason_category are saved immediately
+                        val field = uiState.currentQuestion?.field
+                        if (!field.isNullOrBlank()) {
+                            viewModel.injectSlot(field, choice.value)
+                        }
+
+                        viewModel.sendMessage(choice.value)
+                    },
                     enabled = !uiState.isLoading
                 )
             }
 
-            // Input bar (always available unless complete)
             if (!uiState.showContinueButton) {
                 ChatInputBar(
                     question = uiState.currentQuestion,
                     onSend = { viewModel.sendMessage(it) },
                     onFindNumber = {
-                        // Navigate to PlaceSearch using employer_name from slots
-                        // Use defensive defaults to prevent crashes from missing/empty values
+                        // ✅ FIX 3: use jsonPrimitive.content (avoid quoted strings / "null")
                         val employerName = uiState.slots["employer_name"]
-                            ?.toString()
-                            ?.takeIf { it.isNotBlank() && it != "null" }
+                            ?.jsonPrimitive
+                            ?.content
+                            ?.takeIf { it.isNotBlank() }
                             ?: "business"
+
                         val area = uiState.slots["location"]
-                            ?.toString()
-                            ?.takeIf { it.isNotBlank() && it != "null" }
+                            ?.jsonPrimitive
+                            ?.content
+                            ?.takeIf { it.isNotBlank() }
                             ?: "Australia"
+
                         onNavigateToPlaceSearch(employerName, area)
                     },
                     enabled = !uiState.isLoading && !uiState.showConfirmationCard
@@ -326,22 +336,16 @@ private fun ChatBubble(message: ChatMessageUi) {
                     )
                 )
                 .background(
-                    if (message.isUser) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.surfaceVariant
-                    }
+                    if (message.isUser) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.surfaceVariant
                 )
                 .padding(12.dp)
         ) {
             Text(
                 text = message.content,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (message.isUser) {
-                    MaterialTheme.colorScheme.onPrimary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                }
+                color = if (message.isUser) MaterialTheme.colorScheme.onPrimary
+                else MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
@@ -384,9 +388,7 @@ private fun ConfirmationCardUi(
             containerColor = MaterialTheme.colorScheme.primaryContainer
         )
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp)
-        ) {
+        Column(modifier = Modifier.padding(16.dp)) {
             Text(
                 text = card.title,
                 style = MaterialTheme.typography.titleMedium,
@@ -408,7 +410,6 @@ private fun ConfirmationCardUi(
             Spacer(modifier = Modifier.height(16.dp))
 
             if (isSubmitting) {
-                // Show "Calling..." state with spinner
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center,
@@ -436,17 +437,13 @@ private fun ConfirmationCardUi(
                         onClick = onReject,
                         enabled = enabled,
                         modifier = Modifier.weight(1f)
-                    ) {
-                        Text(card.rejectLabel)
-                    }
+                    ) { Text(card.rejectLabel) }
 
                     Button(
                         onClick = onConfirm,
                         enabled = enabled,
                         modifier = Modifier.weight(1f)
-                    ) {
-                        Text(card.confirmLabel)
-                    }
+                    ) { Text(card.confirmLabel) }
                 }
             }
         }
@@ -516,8 +513,8 @@ private fun ChatInputBar(
     val keyboardType = when (question?.inputType) {
         InputType.NUMBER -> KeyboardType.Number
         InputType.PHONE -> KeyboardType.Phone
-        InputType.DATE -> KeyboardType.Text // Could use date picker in future
-        InputType.TIME -> KeyboardType.Text // Could use time picker in future
+        InputType.DATE -> KeyboardType.Text
+        InputType.TIME -> KeyboardType.Text
         else -> KeyboardType.Text
     }
 
@@ -526,7 +523,6 @@ private fun ChatInputBar(
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
-        // "Find number" button for phone input
         if (isPhoneInput && enabled) {
             OutlinedButton(
                 onClick = onFindNumber,
@@ -594,21 +590,15 @@ private fun ChatInputBar(
                     .size(48.dp)
                     .clip(CircleShape)
                     .background(
-                        if (enabled && inputText.isNotBlank()) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        }
+                        if (enabled && inputText.isNotBlank()) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.surfaceVariant
                     )
             ) {
                 Icon(
                     imageVector = Icons.Filled.Send,
                     contentDescription = "Send",
-                    tint = if (enabled && inputText.isNotBlank()) {
-                        MaterialTheme.colorScheme.onPrimary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                    }
+                    tint = if (enabled && inputText.isNotBlank()) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                 )
             }
         }
