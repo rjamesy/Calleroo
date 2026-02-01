@@ -37,7 +37,10 @@ enum class InputType {
     BOOLEAN,
 
     @SerialName("CHOICE")
-    CHOICE
+    CHOICE,
+
+    @SerialName("PHONE")
+    PHONE
 }
 
 @Serializable
@@ -60,17 +63,17 @@ data class Choice(
 
 @Serializable
 data class Question(
-    val text: String,
-    val field: String,
-    val inputType: InputType,
+    val text: String = "",
+    val field: String = "",
+    val inputType: InputType = InputType.TEXT,
     val choices: List<Choice>? = null,
     val optional: Boolean = false
 )
 
 @Serializable
 data class ConfirmationCard(
-    val title: String,
-    val lines: List<String>,
+    val title: String = "",
+    val lines: List<String> = emptyList(),
     val confirmLabel: String = "Yes",
     val rejectLabel: String = "Not quite"
 )
@@ -80,8 +83,8 @@ data class ConfirmationCard(
  */
 @Serializable
 data class PlaceSearchParams(
-    val query: String,
-    val area: String,
+    val query: String = "",
+    val area: String = "",
     val country: String = "AU"
 )
 
@@ -103,13 +106,13 @@ data class ConversationRequest(
 
 @Serializable
 data class ConversationResponse(
-    val assistantMessage: String,
-    val nextAction: NextAction,
+    val assistantMessage: String = "",
+    val nextAction: NextAction = NextAction.ASK_QUESTION,
     val question: Question? = null,
     val extractedData: JsonObject? = null,
     val confidence: Confidence = Confidence.MEDIUM,
     val confirmationCard: ConfirmationCard? = null,
     val placeSearchParams: PlaceSearchParams? = null,
-    val aiCallMade: Boolean,
-    val aiModel: String
+    val aiCallMade: Boolean = false,
+    val aiModel: String = ""
 )

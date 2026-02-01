@@ -1,11 +1,17 @@
 package com.calleroo.app.ui.navigation
 
 import com.calleroo.app.domain.model.AgentType
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
 sealed class NavRoutes(val route: String) {
     data object AgentSelect : NavRoutes("agent_select")
+
+    /**
+     * Screen: Scheduled Tasks - read-only list of scheduled tasks.
+     */
+    data object ScheduledTasks : NavRoutes("scheduled_tasks")
 
     /**
      * Nested navigation graph for task flow (Screens 2-4).
@@ -27,10 +33,21 @@ sealed class NavRoutes(val route: String) {
      * Screen 3: Place Search - find and select a business to call.
      */
     data object PlaceSearch : NavRoutes("place_search/{query}/{area}") {
+        // Collision-proof sentinel for empty values (user won't type this)
+        private const val EMPTY_SENTINEL = "__CALLEROO_EMPTY__"
+
         fun createRoute(query: String, area: String): String {
-            val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
-            val encodedArea = URLEncoder.encode(area, StandardCharsets.UTF_8.toString())
+            // Defensive: ensure non-empty strings for navigation to prevent crash
+            val safeQuery = query.ifBlank { EMPTY_SENTINEL }
+            val safeArea = area.ifBlank { EMPTY_SENTINEL }
+            val encodedQuery = URLEncoder.encode(safeQuery, StandardCharsets.UTF_8.toString())
+            val encodedArea = URLEncoder.encode(safeArea, StandardCharsets.UTF_8.toString())
             return "place_search/$encodedQuery/$encodedArea"
+        }
+
+        fun decodeParam(encoded: String): String {
+            val decoded = URLDecoder.decode(encoded, StandardCharsets.UTF_8.toString())
+            return if (decoded == EMPTY_SENTINEL) "" else decoded
         }
     }
 

@@ -21,8 +21,8 @@ data class PlaceSearchRequest(
  */
 @Serializable
 data class PlaceCandidate(
-    val placeId: String,
-    val name: String,
+    val placeId: String = "",
+    val name: String = "",
     val formattedAddress: String? = null,
     val lat: Double? = null,
     val lng: Double? = null,
@@ -36,8 +36,8 @@ data class PlaceCandidate(
 @Serializable
 data class PlaceSearchResponse(
     val passNumber: Int = 1,  // 1=25km, 2=50km, 3=100km
-    val radiusKm: Int,
-    val candidates: List<PlaceCandidate>,
+    val radiusKm: Int = 25,
+    val candidates: List<PlaceCandidate> = emptyList(),
     val error: String? = null
 ) {
     val hasError: Boolean get() = error != null
@@ -66,8 +66,8 @@ data class PlaceDetailsRequest(
  */
 @Serializable
 data class PlaceDetailsResponse(
-    val placeId: String,
-    val name: String,
+    val placeId: String = "",
+    val name: String = "",
     val formattedAddress: String? = null,
     val phoneE164: String? = null,
     val error: String? = null

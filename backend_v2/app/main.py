@@ -11,6 +11,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from fastapi.responses import Response
 from .models import (
     ConversationRequest,
     ConversationResponse,
+    NextAction,
     PlaceSearchRequest,
     PlaceSearchResponse,
     PlaceDetailsRequest,
@@ -34,6 +36,8 @@ from .models import (
     CallStartRequestV3,
     CallStartResponseV3,
     CallStatusResponseV1,
+    CallResultFormatRequestV1,
+    CallResultFormatResponseV1,
 )
 from .openai_service import OpenAIService
 from .places_service import GooglePlacesService
@@ -43,7 +47,23 @@ from .call_brief_service import (
     validate_phone_e164,
     CallBriefService,
 )
-from .twilio_service import get_twilio_service, TwilioService, CALL_RUNS
+from .twilio_service import get_twilio_service, TwilioService, CALL_RUNS, HOLD_ACKNOWLEDGEMENT, _is_pure_hold_phrase
+from .call_result_service import get_call_result_service, CallResultService
+
+# Filler phrases for immediate response (filler/poll pattern)
+FILLER_PHRASES = [
+    "One moment.",
+    "Just a sec.",
+    "Ummmmmm.",
+    "Ummm, one sec.",
+]
+
+POLL_FILLER_PHRASES = [
+    "Still checking.",
+    "Almost there.",
+    "One moment.",
+    "Just a sec.",
+]
 
 # Load environment variables from backend_v2/.env
 # Try multiple paths to ensure we find .env
@@ -70,6 +90,7 @@ openai_service: Optional[OpenAIService] = None
 places_service: Optional[GooglePlacesService] = None
 call_brief_service: Optional[CallBriefService] = None
 twilio_service: Optional[TwilioService] = None
+call_result_service: Optional[CallResultService] = None
 
 
 def _mask_key(key: Optional[str]) -> str:
@@ -84,7 +105,7 @@ def _mask_key(key: Optional[str]) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - initialize services."""
-    global openai_service, places_service, call_brief_service, twilio_service
+    global openai_service, places_service, call_brief_service, twilio_service, call_result_service
 
     logger.info("=" * 60)
     logger.info("Initializing Calleroo Backend v2")
@@ -128,6 +149,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Twilio service NOT fully configured - calls will fail gracefully")
 
+    # Initialize Call Result service
+    call_result_service = get_call_result_service()
+    logger.info("Call Result service initialized successfully")
+
     logger.info("=" * 60)
 
     yield
@@ -159,6 +184,102 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "version": "2.0.0"}
+
+
+def sanitize_conversation_response(
+    response: ConversationResponse,
+    conversation_id: str,
+    agent_type: str
+) -> ConversationResponse:
+    """
+    Validate and auto-repair conversation response for schema completeness.
+    Logs warnings and returns a sanitized response.
+
+    Auto-repairs:
+    - FIND_PLACE without placeSearchParams -> ASK_QUESTION
+    - CONFIRM without confirmationCard -> ASK_QUESTION
+    - Empty assistantMessage -> fallback message
+    - Conflicting blocks (e.g., FIND_PLACE with question) -> drop irrelevant blocks
+
+    Warnings only (no repair):
+    - ASK_QUESTION without question (freeform input is acceptable)
+    """
+    warnings = []
+    repairs = []
+
+    # Check and repair assistantMessage
+    assistant_message = response.assistantMessage
+    if not assistant_message or not assistant_message.strip():
+        warnings.append("assistantMessage_empty")
+        assistant_message = "I'm missing one detail to continue. Please type the answer again."
+        repairs.append("assistantMessage_set_fallback")
+
+    # Check and repair nextAction combinations
+    next_action = response.nextAction
+    confirmation_card = response.confirmationCard
+    place_search_params = response.placeSearchParams
+    question = response.question
+
+    # Handle conflicting blocks: nextAction takes precedence
+    if next_action == NextAction.FIND_PLACE:
+        if place_search_params is None:
+            warnings.append("FIND_PLACE_missing_placeSearchParams")
+            next_action = NextAction.ASK_QUESTION
+            assistant_message = "I need more information. What's the name of the business you'd like to call?"
+            repairs.append("downgraded_to_ASK_QUESTION")
+        elif question is not None:
+            # Conflicting: FIND_PLACE should not have question
+            warnings.append("FIND_PLACE_has_conflicting_question")
+            question = None
+            repairs.append("dropped_question_for_FIND_PLACE")
+
+    elif next_action == NextAction.CONFIRM:
+        if confirmation_card is None:
+            warnings.append("CONFIRM_missing_confirmationCard")
+            next_action = NextAction.ASK_QUESTION
+            repairs.append("downgraded_to_ASK_QUESTION")
+        elif question is not None:
+            # Conflicting: CONFIRM should not have question
+            warnings.append("CONFIRM_has_conflicting_question")
+            question = None
+            repairs.append("dropped_question_for_CONFIRM")
+
+    elif next_action == NextAction.ASK_QUESTION:
+        if question is None:
+            warnings.append("ASK_QUESTION_missing_question")
+            # No repair - freeform input is acceptable
+
+    # Metric log for monitoring sanitization rate (scrapable)
+    # Format: METRIC sanitization_applied agent=X repairs=N warnings=N
+    if repairs:
+        logger.info(
+            f"METRIC sanitization_applied agent={agent_type} "
+            f"repairs={len(repairs)} warnings={len(warnings)} "
+            f"conversationId={conversation_id}"
+        )
+
+    # Log details if any issues found
+    if warnings:
+        logger.warning(
+            f"Response sanitized [conversationId={conversation_id}, agent={agent_type}]: "
+            f"warnings={warnings}, repairs={repairs}"
+        )
+
+    # Return sanitized response if repairs were made
+    if repairs:
+        return ConversationResponse(
+            assistantMessage=assistant_message,
+            nextAction=next_action,
+            question=question,
+            extractedData=response.extractedData,
+            confidence=response.confidence,
+            confirmationCard=confirmation_card if next_action == NextAction.CONFIRM else None,
+            placeSearchParams=place_search_params if next_action == NextAction.FIND_PLACE else None,
+            aiCallMade=response.aiCallMade,
+            aiModel=response.aiModel
+        )
+
+    return response
 
 
 @app.post("/conversation/next", response_model=ConversationResponse)
@@ -206,6 +327,13 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
                 status_code=500,
                 detail="openai_not_called: Backend must always call OpenAI"
             )
+
+        # Sanitize response: validate and auto-repair invalid combinations
+        response = sanitize_conversation_response(
+            response,
+            request.conversationId,
+            request.agentType.value
+        )
 
         # Log the response
         logger.info(
@@ -605,6 +733,63 @@ async def call_status(call_id: str) -> CallStatusResponseV1:
     )
 
 
+@app.post("/call/result/format", response_model=CallResultFormatResponseV1)
+async def format_call_result(request: CallResultFormatRequestV1) -> CallResultFormatResponseV1:
+    """
+    Format call results for display in the mobile app.
+
+    Takes raw call data (status, transcript, outcome) and returns
+    a user-friendly formatted summary with bullets and next steps.
+
+    Uses OpenAI when transcript or outcome is available.
+    Returns deterministic response when both are missing.
+
+    Returns:
+        CallResultFormatResponseV1 with formatted title, bullets, facts, next steps
+
+    Errors:
+        500: OpenAI formatting failed
+    """
+    logger.info(f"Call result format request: callId={request.callId}, status={request.status}")
+
+    if call_result_service is None:
+        raise HTTPException(
+            status_code=500,
+            detail="call_result_service_unavailable: Service not initialized"
+        )
+
+    try:
+        result = await call_result_service.format_call_result(
+            agent_type=request.agentType,
+            call_id=request.callId,
+            status=request.status,
+            duration_seconds=request.durationSeconds,
+            transcript=request.transcript,
+            outcome=request.outcome,
+            error=request.error,
+            event_transcript=request.eventTranscript,
+            business_name=request.businessName,
+        )
+
+        return CallResultFormatResponseV1(
+            title=result["title"],
+            summary=result.get("summary"),
+            bullets=result["bullets"],
+            extractedFacts=result["extractedFacts"],
+            nextSteps=result["nextSteps"],
+            formattedTranscript=result.get("formattedTranscript"),
+            aiCallMade=result["aiCallMade"],
+            aiModel=result["aiModel"],
+        )
+
+    except RuntimeError as e:
+        logger.error(f"Call result format failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
 # ============================================================
 # Twilio Webhooks (Step 4)
 # ============================================================
@@ -621,15 +806,67 @@ def _escape_xml(text: str) -> str:
     )
 
 
+def _is_terminal_text(text: str) -> bool:
+    """Check if text indicates the agent is ending the call (goodbye intent).
+
+    Returns True if text contains a goodbye phrase AND no question mark.
+    This is a deterministic heuristic to detect terminal responses.
+
+    Handles punctuation variations like:
+    - "Thanks for your time. Goodbye!"
+    - "Thank you for your time, goodbye."
+    - "Goodbye"
+    """
+    text_lower = text.lower()
+
+    # If there's a question mark, it's not terminal (agent is still asking something)
+    if "?" in text:
+        return False
+
+    # Normalize text: remove extra punctuation for matching
+    # This handles "goodbye!" "goodbye." "goodbye," etc.
+    import re
+    text_normalized = re.sub(r'[.,!;:\-—]+', ' ', text_lower)
+    text_normalized = ' '.join(text_normalized.split())  # Collapse whitespace
+
+    # Check for goodbye phrases (order matters - check specific phrases first)
+    goodbye_phrases = [
+        # Longer/specific phrases first
+        "thank you for your time",
+        "thanks for your time",
+        "have a great day",
+        "have a good day",
+        "have a nice day",
+        "take care",
+        # Short phrases last (to avoid false positives)
+        "goodbye",
+        "good bye",
+        "bye bye",
+        "bye",
+    ]
+
+    for phrase in goodbye_phrases:
+        if phrase in text_normalized:
+            return True
+
+    return False
+
+
+
+
 @app.post("/twilio/voice")
-async def twilio_voice(conversationId: str = Query(...)):
+async def twilio_voice(
+    background_tasks: BackgroundTasks,
+    conversationId: str = Query(...)
+):
     """
     Twilio voice webhook - called when call connects.
 
-    Starts the conversation and waits for the callee to speak.
-    Initializes live conversation state for autonomous agent.
+    User speaks FIRST. Opener is pre-warmed in background but NOT spoken
+    until after the user's first speech ends and Twilio posts to /twilio/gather.
     """
-    logger.info(f"Twilio voice webhook: conversationId={conversationId}")
+    voice_received_at = datetime.utcnow()
+    logger.info(f"[TIMING] /twilio/voice received at {voice_received_at.isoformat()} for conversationId={conversationId}")
 
     # Find the call run by conversation_id
     call_run = None
@@ -639,64 +876,95 @@ async def twilio_voice(conversationId: str = Query(...)):
             break
 
     if call_run:
-        opening_line = "Hello, this is Calleroo. Are you able to help me with a quick question?"
         # Initialize live conversation state
-        call_run.turn = 1
+        call_run.turn = 0
         call_run.retry = 0
-        call_run.live_transcript = [f"Assistant: {opening_line}"]
+        call_run.live_transcript = []
+
+        # Start generating opener if not already ready
+        if twilio_service is not None and call_run.pending_agent_reply is None:
+            opener_context = f"The callee just answered the phone. Greet them briefly and state why you're calling based on: {call_run.script_preview}"
+            background_tasks.add_task(
+                twilio_service.generate_agent_response_async,
+                call_run.call_id,
+                opener_context
+            )
+            logger.info(f"[TIMING] Pre-warming opener started for call {call_run.call_id}")
+        elif call_run.pending_agent_reply is not None:
+            logger.info(f"[TIMING] Opener already ready for call {call_run.call_id}, skipping pre-warm")
     else:
-        opening_line = "Hello, this is Calleroo. I'm sorry, something went wrong."
+        logger.warning(f"twilio_voice: No call run found for conversation {conversationId}")
 
     webhook_base = os.getenv('WEBHOOK_BASE_URL')
+
+    # Hybrid approach: 1s silent wait, then agent says "Hello?" if no speech
+    # This avoids the 10-second Twilio speech detection delay
+    # Flow:
+    # 1. Call connects → 1s silent wait (first Gather)
+    # 2. If user speaks → /twilio/gather fires with their speech
+    # 3. If silence after 1s → Agent says "Hello?" → second Gather
+    # 4. If still silence → Hang up
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather
         input="speech"
-        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=0"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=0&amp;retry=0"
         method="POST"
-        timeout="6"
-        speechTimeout="auto"
+        timeout="1"
+        speechTimeout="1"
+        speechModel="phone_call"
+        enhanced="true"
         language="en-AU">
-
-        <Say voice="Polly.Matthew" language="en-AU">
-            {_escape_xml(opening_line)}
-        </Say>
-
     </Gather>
 
-    <Say voice="Polly.Matthew" language="en-AU">
-        Sorry, I didn't hear anything.
+    <Say voice="en-AU-Wavenet-C" language="en-AU">Hello?</Say>
+
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=0&amp;retry=1"
+        method="POST"
+        timeout="5"
+        speechTimeout="1"
+        speechModel="phone_call"
+        enhanced="true"
+        language="en-AU">
+    </Gather>
+
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        I haven't heard anything. Goodbye.
     </Say>
-    <Redirect method="POST">
-        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=1
-    </Redirect>
+    <Hangup/>
 </Response>"""
+
+    twiml_ready_at = datetime.utcnow()
+    logger.info(f"[TIMING] /twilio/voice returning TwiML at {twiml_ready_at.isoformat()} (Hybrid: 1s silent wait, then 'Hello?')")
 
     return Response(content=twiml, media_type="application/xml")
 
 
 @app.post("/twilio/gather")
 async def twilio_gather(
+    background_tasks: BackgroundTasks,
     conversationId: str = Query(...),
-    turn: int = Query(1),
+    turn: int = Query(0),
     retry: int = Query(0),
     SpeechResult: str = Form(""),
 ):
     """
-    Twilio gather webhook - processes speech input and generates next response.
+    Twilio gather webhook - processes speech input and starts async response generation.
 
-    This endpoint drives the turn-by-turn autonomous conversation:
-    1. Receives user speech (or silence)
-    2. Updates live transcript
-    3. Calls OpenAI to generate next response
-    4. Returns TwiML with response and next Gather
+    This endpoint uses a filler/poll pattern for natural conversation flow:
+    1. When speech received: append to transcript, start background OpenAI task
+    2. Return filler TwiML with redirect to /twilio/poll
+    3. Poll endpoint checks if response is ready
 
     Handles:
+    - Turn 0: First speech from callee (their greeting)
     - Silence: retry up to 2 times, then hang up
     - Turn limit: after 8 turns, end call politely
-    - Normal conversation: AI-driven responses
     """
-    logger.info(f"Twilio gather: conversationId={conversationId}, turn={turn}, retry={retry}, speech='{SpeechResult[:50] if SpeechResult else ''}'")
+    gather_received_at = datetime.utcnow()
+    logger.info(f"[TIMING] /twilio/gather received at {gather_received_at.isoformat()} - turn={turn}, retry={retry}, speech='{SpeechResult[:50] if SpeechResult else ''}'")
 
     webhook_base = os.getenv('WEBHOOK_BASE_URL')
 
@@ -711,7 +979,16 @@ async def twilio_gather(
         logger.error(f"twilio_gather: No call run found for conversation {conversationId}")
         twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew" language="en-AU">I'm sorry, something went wrong. Goodbye.</Say>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">I'm sorry, something went wrong. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Guard: if call is already terminal (race condition / Twilio retry), just hangup
+    if call_run.is_terminal:
+        logger.info(f"twilio_gather: Call already terminal, hanging up")
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
     <Hangup/>
 </Response>"""
         return Response(content=twiml, media_type="application/xml")
@@ -730,12 +1007,17 @@ async def twilio_gather(
             logger.info(f"Max retries reached, hanging up")
             twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew" language="en-AU">I haven't heard anything. Thanks for your time. Goodbye.</Say>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">I haven't heard anything. Thanks for your time. Goodbye.</Say>
     <Hangup/>
 </Response>"""
             return Response(content=twiml, media_type="application/xml")
 
-        # Re-prompt
+        # Re-prompt (different message for turn 0 vs later turns)
+        if turn == 0:
+            prompt_message = "Hello? Is anyone there?"
+        else:
+            prompt_message = "I'm sorry, I didn't catch that. Could you please repeat?"
+
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather
@@ -743,16 +1025,18 @@ async def twilio_gather(
         action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry={new_retry}"
         method="POST"
         timeout="6"
-        speechTimeout="auto"
+        speechTimeout="1"
+        speechModel="phone_call"
+        enhanced="true"
         language="en-AU">
 
-        <Say voice="Polly.Matthew" language="en-AU">
-            I'm sorry, I didn't catch that. Could you please repeat?
+        <Say voice="en-AU-Wavenet-C" language="en-AU">
+            {_escape_xml(prompt_message)}
         </Say>
 
     </Gather>
 
-    <Say voice="Polly.Matthew" language="en-AU">
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
         I still can't hear you. Thanks for your time. Goodbye.
     </Say>
     <Hangup/>
@@ -764,7 +1048,7 @@ async def twilio_gather(
         logger.info(f"Turn limit reached ({turn}), ending call")
         twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew" language="en-AU">Thank you so much for your help. I have all the information I need. Have a great day. Goodbye.</Say>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">Thank you so much for your help. I have all the information I need. Have a great day. Goodbye.</Say>
     <Hangup/>
 </Response>"""
         return Response(content=twiml, media_type="application/xml")
@@ -775,43 +1059,259 @@ async def twilio_gather(
     # Update live transcript with user speech
     call_run.live_transcript.append(f"User: {user_speech}")
 
-    # Generate AI response
-    if twilio_service is not None:
-        agent_response = await twilio_service.generate_agent_response(call_run, user_speech)
-    else:
-        agent_response = "I'm sorry, I'm having technical difficulties. Thank you for your time. Goodbye."
-        logger.error("twilio_gather: twilio_service is None")
+    # Check for hold/checking phrases - respond with acknowledgement and wait (don't advance questions)
+    # Only triggers for PURE hold phrases (no substantive info like numbers, yes/no, prices)
+    if turn > 0 and _is_pure_hold_phrase(user_speech):
+        logger.info(f"Hold phrase detected: '{user_speech}', responding with acknowledgement")
 
-    # Update live transcript with agent response
-    call_run.live_transcript.append(f"Assistant: {agent_response}")
+        # Update live transcript with acknowledgement
+        call_run.live_transcript.append(f"Assistant: {HOLD_ACKNOWLEDGEMENT}")
 
-    # Update turn for next iteration
-    next_turn = turn + 1
-    call_run.turn = next_turn
-    call_run.retry = 0
-
-    # Build TwiML response
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        # DON'T advance turn - just gather again at same turn
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather
         input="speech"
-        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={next_turn}&amp;retry=0"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry=0"
         method="POST"
-        timeout="6"
-        speechTimeout="auto"
+        timeout="10"
+        speechTimeout="2"
+        speechModel="phone_call"
+        enhanced="true"
         language="en-AU">
 
-        <Say voice="Polly.Matthew" language="en-AU">
+        <Say voice="en-AU-Wavenet-C" language="en-AU">
+            {_escape_xml(HOLD_ACKNOWLEDGEMENT)}
+        </Say>
+
+    </Gather>
+
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        I didn't hear anything. Let me know when you're ready.
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry=1
+    </Redirect>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Check if we have a pre-warmed response ready (turn 0 uses pre-warmed opener)
+    if turn == 0 and call_run.pending_agent_reply is not None:
+        # Pre-warmed opener is ready - deliver it IMMEDIATELY (no filler, no poll)
+        agent_response = call_run.pending_agent_reply
+        deliver_at = datetime.utcnow()
+        logger.info(f"[TIMING] Delivering pre-warmed opener at {deliver_at.isoformat()} for call {call_run.call_id}: {agent_response[:50]}...")
+
+        # Clear pending state
+        call_run.pending_agent_reply = None
+        call_run.pending_user_speech = None
+        call_run.pending_started_at = None
+
+        # Update live transcript
+        call_run.live_transcript.append(f"Assistant: {agent_response}")
+
+        # Update turn state
+        call_run.turn = 1
+        call_run.retry = 0
+
+        # Return Gather TwiML immediately with the opener
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=0"
+        method="POST"
+        timeout="6"
+        speechTimeout="1"
+        speechModel="phone_call"
+        enhanced="true"
+        language="en-AU">
+
+        <Say voice="en-AU-Wavenet-C" language="en-AU">
             {_escape_xml(agent_response)}
         </Say>
 
     </Gather>
 
-    <Say voice="Polly.Matthew" language="en-AU">
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
         I didn't hear anything.
     </Say>
     <Redirect method="POST">
-        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={next_turn}&amp;retry=1
+        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=1
+    </Redirect>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    elif twilio_service is not None:
+        # Start async generation in background
+        background_tasks.add_task(
+            twilio_service.generate_agent_response_async,
+            call_run.call_id,
+            user_speech
+        )
+    else:
+        logger.error("twilio_gather: twilio_service is None")
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">I'm sorry, I'm having technical difficulties. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Select filler phrase based on turn number
+    filler = FILLER_PHRASES[turn % len(FILLER_PHRASES)]
+    next_turn = turn + 1
+
+    # Return filler TwiML with redirect to poll endpoint (no pause - faster response)
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        {_escape_xml(filler)}
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/poll?conversationId={conversationId}&amp;turn={next_turn}&amp;attempt=0
+    </Redirect>
+</Response>"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/twilio/poll")
+async def twilio_poll(
+    conversationId: str = Query(...),
+    turn: int = Query(1),
+    attempt: int = Query(0),
+):
+    """
+    Twilio poll endpoint - checks if async response is ready.
+
+    Polling logic:
+    - If pending_agent_reply ready: return normal Gather TwiML with response
+    - If not ready and attempt < 3: return filler + pause + redirect to poll with attempt+1
+    - If attempt >= 3: return filler + redirect to poll with attempt=0 (reset)
+    - Hard cap: if pending_started_at > 20 seconds ago, hang up with apology
+    """
+    logger.debug(f"Twilio poll: conversationId={conversationId}, turn={turn}, attempt={attempt}")
+
+    webhook_base = os.getenv('WEBHOOK_BASE_URL')
+
+    # Find the call run by conversation_id
+    call_run = None
+    for run in CALL_RUNS.values():
+        if run.conversation_id == conversationId:
+            call_run = run
+            break
+
+    if not call_run:
+        logger.error(f"twilio_poll: No call run found for conversation {conversationId}")
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">I'm sorry, something went wrong. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Hard timeout check - 20 seconds
+    if call_run.pending_started_at:
+        elapsed = (datetime.utcnow() - call_run.pending_started_at).total_seconds()
+        if elapsed > 20:
+            logger.warning(f"Poll timeout exceeded ({elapsed}s) for conversation {conversationId}")
+            twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">I apologize, I'm having technical difficulties. Thank you for your patience. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+            return Response(content=twiml, media_type="application/xml")
+
+    # Check if response is ready
+    if call_run.pending_agent_reply is not None:
+        agent_response = call_run.pending_agent_reply
+
+        # Update live transcript with agent response
+        call_run.live_transcript.append(f"Assistant: {agent_response}")
+
+        # Clear pending state
+        call_run.pending_agent_reply = None
+        call_run.pending_user_speech = None
+        call_run.pending_started_at = None
+
+        # Update turn state
+        call_run.turn = turn
+        call_run.retry = 0
+
+        # Check if this is a terminal response (goodbye)
+        is_terminal = _is_terminal_text(agent_response)
+        call_run.is_terminal = is_terminal
+
+        if is_terminal:
+            # Terminal response - Say goodbye and Hangup immediately (no Gather, no fallback)
+            logger.info(f"Poll returning TERMINAL response for turn {turn}: {agent_response[:50]}...")
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">{_escape_xml(agent_response)}</Say>
+    <Hangup/>
+</Response>"""
+            return Response(content=twiml, media_type="application/xml")
+
+        # Non-terminal response - normal Gather TwiML
+        logger.info(f"Poll returning ready response for turn {turn}: {agent_response[:50]}...")
+
+        # Return normal Gather TwiML with the response
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry=0"
+        method="POST"
+        timeout="6"
+        speechTimeout="1"
+        speechModel="phone_call"
+        enhanced="true"
+        language="en-AU">
+
+        <Say voice="en-AU-Wavenet-C" language="en-AU">
+            {_escape_xml(agent_response)}
+        </Say>
+
+    </Gather>
+
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        I didn't hear anything.
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry=1
+    </Redirect>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Response not ready yet - continue polling
+    logger.debug(f"Response not ready, attempt={attempt}")
+
+    # Select poll filler based on attempt
+    poll_filler = POLL_FILLER_PHRASES[attempt % len(POLL_FILLER_PHRASES)]
+
+    if attempt >= 3:
+        # Reset attempt counter
+        next_attempt = 0
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        {_escape_xml(poll_filler)}
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/poll?conversationId={conversationId}&amp;turn={turn}&amp;attempt={next_attempt}
+    </Redirect>
+</Response>"""
+    else:
+        # Return filler + redirect with incremented attempt (no pause - faster)
+        next_attempt = attempt + 1
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="en-AU-Wavenet-C" language="en-AU">
+        {_escape_xml(poll_filler)}
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/poll?conversationId={conversationId}&amp;turn={turn}&amp;attempt={next_attempt}
     </Redirect>
 </Response>"""
 

@@ -290,3 +290,157 @@ class TestErrorHandling:
 
         # Should be a 422 validation error
         assert response.status_code == 422
+
+
+class TestResponseSanitization:
+    """Tests for response sanitization (auto-repair of invalid responses)."""
+
+    def test_sanitize_find_place_without_params(self):
+        """Test that FIND_PLACE without placeSearchParams is downgraded."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction, Confidence
+
+        response = ConversationResponse(
+            assistantMessage="Let me find that for you",
+            nextAction=NextAction.FIND_PLACE,
+            placeSearchParams=None,  # Missing!
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-1", "SICK_CALLER")
+
+        # Should be downgraded to ASK_QUESTION
+        assert sanitized.nextAction == NextAction.ASK_QUESTION
+        assert "business" in sanitized.assistantMessage.lower() or "information" in sanitized.assistantMessage.lower()
+
+    def test_sanitize_confirm_without_card(self):
+        """Test that CONFIRM without confirmationCard is downgraded."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        response = ConversationResponse(
+            assistantMessage="Let me confirm that",
+            nextAction=NextAction.CONFIRM,
+            confirmationCard=None,  # Missing!
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-2", "SICK_CALLER")
+
+        # Should be downgraded to ASK_QUESTION
+        assert sanitized.nextAction == NextAction.ASK_QUESTION
+
+    def test_sanitize_empty_assistant_message(self):
+        """Test that empty assistantMessage is replaced with fallback."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        response = ConversationResponse(
+            assistantMessage="",  # Empty!
+            nextAction=NextAction.ASK_QUESTION,
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-3", "STOCK_CHECKER")
+
+        assert sanitized.assistantMessage != ""
+        assert "try again" in sanitized.assistantMessage.lower() or "detail" in sanitized.assistantMessage.lower()
+
+    def test_sanitize_valid_response_unchanged(self):
+        """Test that valid responses are not modified."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction, Question, InputType
+
+        response = ConversationResponse(
+            assistantMessage="What store would you like to check?",
+            nextAction=NextAction.ASK_QUESTION,
+            question=Question(
+                text="Which store?",
+                field="retailer_name",
+                inputType=InputType.TEXT
+            ),
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-4", "STOCK_CHECKER")
+
+        # Should be unchanged
+        assert sanitized.assistantMessage == response.assistantMessage
+        assert sanitized.nextAction == response.nextAction
+        assert sanitized.question == response.question
+
+    def test_sanitize_ask_question_without_question_warns_only(self):
+        """Test that ASK_QUESTION without question is NOT downgraded (just warns)."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        response = ConversationResponse(
+            assistantMessage="Please tell me more",
+            nextAction=NextAction.ASK_QUESTION,
+            question=None,  # Missing, but acceptable for freeform input
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-5", "RESTAURANT_RESERVATION")
+
+        # Should remain ASK_QUESTION - freeform input is acceptable
+        assert sanitized.nextAction == NextAction.ASK_QUESTION
+        assert sanitized.assistantMessage == response.assistantMessage
+
+    def test_sanitize_find_place_with_conflicting_question(self):
+        """Test that FIND_PLACE with conflicting question drops the question."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction, Question, InputType, PlaceSearchParams
+
+        response = ConversationResponse(
+            assistantMessage="Let me search for that",
+            nextAction=NextAction.FIND_PLACE,
+            placeSearchParams=PlaceSearchParams(query="Acme Corp", area="Sydney"),
+            question=Question(  # Conflicting!
+                text="Which store?",
+                field="retailer_name",
+                inputType=InputType.TEXT
+            ),
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-6", "SICK_CALLER")
+
+        # Should remain FIND_PLACE but drop question
+        assert sanitized.nextAction == NextAction.FIND_PLACE
+        assert sanitized.placeSearchParams is not None
+        assert sanitized.question is None  # Dropped
+
+    def test_sanitize_confirm_with_conflicting_question(self):
+        """Test that CONFIRM with conflicting question drops the question."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction, Question, InputType, ConfirmationCard
+
+        response = ConversationResponse(
+            assistantMessage="Please confirm the details",
+            nextAction=NextAction.CONFIRM,
+            confirmationCard=ConfirmationCard(
+                title="Confirm Details",
+                lines=["Name: John", "Time: 2pm"]
+            ),
+            question=Question(  # Conflicting!
+                text="Which store?",
+                field="retailer_name",
+                inputType=InputType.TEXT
+            ),
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(response, "test-conv-7", "SICK_CALLER")
+
+        # Should remain CONFIRM but drop question
+        assert sanitized.nextAction == NextAction.CONFIRM
+        assert sanitized.confirmationCard is not None
+        assert sanitized.question is None  # Dropped

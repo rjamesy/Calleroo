@@ -27,6 +27,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -118,9 +119,14 @@ fun UnifiedChatScreen(
     // Navigate to Place Search when backend returns FIND_PLACE
     LaunchedEffect(uiState.nextAction, uiState.placeSearchParams) {
         if (uiState.nextAction == NextAction.FIND_PLACE && uiState.placeSearchParams != null) {
-            val params = uiState.placeSearchParams!!
-            viewModel.clearPlaceSearchParams()
-            onNavigateToPlaceSearch(params.query, params.area)
+            val params = uiState.placeSearchParams
+            if (params != null) {
+                viewModel.clearPlaceSearchParams()
+                // Use defensive defaults - empty query/area will be handled by PlaceSearchViewModel
+                val safeQuery = params.query.ifBlank { "business" }
+                val safeArea = params.area.ifBlank { "Australia" }
+                onNavigateToPlaceSearch(safeQuery, safeArea)
+            }
         }
     }
 
@@ -193,13 +199,15 @@ fun UnifiedChatScreen(
             }
 
             // Confirmation card (when backend returns CONFIRM)
-            if (uiState.showConfirmationCard && uiState.confirmationCard != null) {
-                ConfirmationCardUi(
-                    card = uiState.confirmationCard!!,
-                    onConfirm = { viewModel.handleConfirmation(true) },
-                    onReject = { viewModel.handleConfirmation(false) },
-                    enabled = !uiState.isLoading
-                )
+            uiState.confirmationCard?.let { card ->
+                if (uiState.showConfirmationCard) {
+                    ConfirmationCardUi(
+                        card = card,
+                        onConfirm = { viewModel.handleConfirmation(true) },
+                        onReject = { viewModel.handleConfirmation(false) },
+                        enabled = !uiState.isLoading
+                    )
+                }
             }
 
             // Complete state - show Continue button
@@ -210,15 +218,17 @@ fun UnifiedChatScreen(
             }
 
             // Choice chips (ONLY when backend sends them)
-            if (uiState.currentQuestion?.choices != null && !uiState.showConfirmationCard && !uiState.showContinueButton) {
+            val currentQuestion = uiState.currentQuestion
+            val choices = currentQuestion?.choices
+            if (!choices.isNullOrEmpty() && !uiState.showConfirmationCard && !uiState.showContinueButton) {
                 // CRITICAL: Validate choices come from backend
                 UnifiedConversationGuard.assertChoicesFromBackend(
-                    choices = uiState.currentQuestion?.choices,
+                    choices = choices,
                     backendProvided = true
                 )
 
                 ChoiceChips(
-                    choices = uiState.currentQuestion!!.choices!!,
+                    choices = choices,
                     onChoiceSelected = { choice -> viewModel.sendMessage(choice.value) },
                     enabled = !uiState.isLoading
                 )
@@ -229,6 +239,19 @@ fun UnifiedChatScreen(
                 ChatInputBar(
                     question = uiState.currentQuestion,
                     onSend = { viewModel.sendMessage(it) },
+                    onFindNumber = {
+                        // Navigate to PlaceSearch using employer_name from slots
+                        // Use defensive defaults to prevent crashes from missing/empty values
+                        val employerName = uiState.slots["employer_name"]
+                            ?.toString()
+                            ?.takeIf { it.isNotBlank() && it != "null" }
+                            ?: "business"
+                        val area = uiState.slots["location"]
+                            ?.toString()
+                            ?.takeIf { it.isNotBlank() && it != "null" }
+                            ?: "Australia"
+                        onNavigateToPlaceSearch(employerName, area)
+                    },
                     enabled = !uiState.isLoading && !uiState.showConfirmationCard
                 )
             }
@@ -412,82 +435,110 @@ private fun ChoiceChips(
 private fun ChatInputBar(
     question: Question?,
     onSend: (String) -> Unit,
+    onFindNumber: () -> Unit,
     enabled: Boolean
 ) {
     var inputText by remember { mutableStateOf("") }
 
+    val isPhoneInput = question?.inputType == InputType.PHONE
     val keyboardType = when (question?.inputType) {
         InputType.NUMBER -> KeyboardType.Number
+        InputType.PHONE -> KeyboardType.Phone
         InputType.DATE -> KeyboardType.Text // Could use date picker in future
         InputType.TIME -> KeyboardType.Text // Could use time picker in future
         else -> KeyboardType.Text
     }
 
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.Bottom
+            .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
-        OutlinedTextField(
-            value = inputText,
-            onValueChange = { inputText = it },
-            modifier = Modifier.weight(1f),
-            placeholder = {
-                Text(
-                    text = question?.text ?: "Type a message...",
-                    style = MaterialTheme.typography.bodyMedium
+        // "Find number" button for phone input
+        if (isPhoneInput && enabled) {
+            OutlinedButton(
+                onClick = onFindNumber,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.primary
                 )
-            },
-            enabled = enabled,
-            singleLine = false,
-            maxLines = 4,
-            keyboardOptions = KeyboardOptions(
-                capitalization = KeyboardCapitalization.Sentences,
-                keyboardType = keyboardType,
-                imeAction = ImeAction.Send
-            ),
-            keyboardActions = KeyboardActions(
-                onSend = {
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Search,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Find number")
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            OutlinedTextField(
+                value = inputText,
+                onValueChange = { inputText = it },
+                modifier = Modifier.weight(1f),
+                placeholder = {
+                    Text(
+                        text = question?.text ?: "Type a message...",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                },
+                enabled = enabled,
+                singleLine = false,
+                maxLines = 4,
+                keyboardOptions = KeyboardOptions(
+                    capitalization = if (isPhoneInput) KeyboardCapitalization.None else KeyboardCapitalization.Sentences,
+                    keyboardType = keyboardType,
+                    imeAction = ImeAction.Send
+                ),
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        if (inputText.isNotBlank()) {
+                            onSend(inputText)
+                            inputText = ""
+                        }
+                    }
+                ),
+                shape = RoundedCornerShape(24.dp)
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            IconButton(
+                onClick = {
                     if (inputText.isNotBlank()) {
                         onSend(inputText)
                         inputText = ""
                     }
-                }
-            ),
-            shape = RoundedCornerShape(24.dp)
-        )
-
-        Spacer(modifier = Modifier.width(8.dp))
-
-        IconButton(
-            onClick = {
-                if (inputText.isNotBlank()) {
-                    onSend(inputText)
-                    inputText = ""
-                }
-            },
-            enabled = enabled && inputText.isNotBlank(),
-            modifier = Modifier
-                .size(48.dp)
-                .clip(CircleShape)
-                .background(
-                    if (enabled && inputText.isNotBlank()) {
-                        MaterialTheme.colorScheme.primary
+                },
+                enabled = enabled && inputText.isNotBlank(),
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (enabled && inputText.isNotBlank()) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        }
+                    )
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Send,
+                    contentDescription = "Send",
+                    tint = if (enabled && inputText.isNotBlank()) {
+                        MaterialTheme.colorScheme.onPrimary
                     } else {
-                        MaterialTheme.colorScheme.surfaceVariant
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                     }
                 )
-        ) {
-            Icon(
-                imageVector = Icons.Filled.Send,
-                contentDescription = "Send",
-                tint = if (enabled && inputText.isNotBlank()) {
-                    MaterialTheme.colorScheme.onPrimary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                }
-            )
+            }
         }
     }
 }

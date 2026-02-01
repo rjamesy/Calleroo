@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.calleroo.app.BuildConfig
 import com.calleroo.app.domain.model.PlaceCandidate
 import com.calleroo.app.repository.PlacesRepository
+import com.calleroo.app.ui.navigation.NavRoutes
 import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -14,8 +15,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.net.URLDecoder
-import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 
 /**
@@ -48,14 +47,12 @@ class PlaceSearchViewModel @Inject constructor(
     private val _manualEntryError = MutableStateFlow<String?>(null)
     val manualEntryError: StateFlow<String?> = _manualEntryError.asStateFlow()
 
-    // Navigation arguments (URL decoded)
-    val query: String = URLDecoder.decode(
-        savedStateHandle.get<String>("query") ?: "",
-        StandardCharsets.UTF_8.toString()
+    // Navigation arguments (URL decoded via NavRoutes helper)
+    val query: String = NavRoutes.PlaceSearch.decodeParam(
+        savedStateHandle.get<String>("query") ?: ""
     )
-    val area: String = URLDecoder.decode(
-        savedStateHandle.get<String>("area") ?: "",
-        StandardCharsets.UTF_8.toString()
+    val area: String = NavRoutes.PlaceSearch.decodeParam(
+        savedStateHandle.get<String>("area") ?: ""
     )
 
     // Track current state for retry and expansion
@@ -205,12 +202,17 @@ class PlaceSearchViewModel @Inject constructor(
      */
     fun confirmSelection() {
         val current = _state.value
-        if (current !is PlaceSearchState.Results || current.selectedCandidate == null) {
+        if (current !is PlaceSearchState.Results) {
+            Log.w(TAG, "confirmSelection called without Results state")
+            return
+        }
+
+        val candidate = current.selectedCandidate
+        if (candidate == null) {
             Log.w(TAG, "confirmSelection called without valid selection")
             return
         }
 
-        val candidate = current.selectedCandidate!!
         _state.value = PlaceSearchState.Resolving(
             placeId = candidate.placeId,
             placeName = candidate.name
