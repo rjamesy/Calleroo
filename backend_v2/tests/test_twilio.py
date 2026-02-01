@@ -310,3 +310,106 @@ class TestTwilioServiceUnit:
         assert "&lt;product&gt;" in twiml
         assert "&amp;" in twiml
         assert "<product>" not in twiml  # Should be escaped
+
+
+class TestTerminalResponseHangup:
+    """Tests for terminal response (goodbye) handling"""
+
+    @pytest.mark.asyncio
+    async def test_terminal_response_hangup(self, client: AsyncClient):
+        """Test that terminal response (goodbye) returns Hangup without fallback."""
+        # Add a call run with a pending terminal response
+        call_run = CallRun(
+            call_id="test-terminal",
+            conversation_id="conv-terminal",
+            agent_type="STOCK_CHECKER",
+            phone_e164="+61731824583",
+            script_preview="Check stock for product.",
+            pending_agent_reply="Thank you for your time. Goodbye.",
+            is_generating=False,
+        )
+        CALL_RUNS["test-terminal"] = call_run
+
+        # Call /twilio/poll which should detect terminal and return Hangup
+        response = await client.post(
+            "/twilio/poll?conversationId=conv-terminal&turn=2&attempt=0"
+        )
+
+        assert response.status_code == 200
+        response_text = response.text
+
+        # Must contain Hangup
+        assert "<Hangup/>" in response_text
+
+        # Must NOT contain fallback "I didn't hear anything"
+        assert "I didn't hear anything" not in response_text
+
+        # Must NOT contain Gather (no speech input expected after goodbye)
+        assert "<Gather" not in response_text
+
+        # Must NOT contain Redirect
+        assert "<Redirect" not in response_text
+
+        # Verify is_terminal flag was set
+        assert CALL_RUNS["test-terminal"].is_terminal is True
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_response_has_gather(self, client: AsyncClient):
+        """Test that non-terminal response still includes Gather and fallback."""
+        call_run = CallRun(
+            call_id="test-nonterminal",
+            conversation_id="conv-nonterminal",
+            agent_type="STOCK_CHECKER",
+            phone_e164="+61731824583",
+            script_preview="Check stock for product.",
+            pending_agent_reply="Do you have any BBQ chickens in stock?",
+            is_generating=False,
+        )
+        CALL_RUNS["test-nonterminal"] = call_run
+
+        response = await client.post(
+            "/twilio/poll?conversationId=conv-nonterminal&turn=2&attempt=0"
+        )
+
+        assert response.status_code == 200
+        response_text = response.text
+
+        # Should contain Gather (waiting for response)
+        assert "<Gather" in response_text
+
+        # Should contain fallback
+        assert "I didn't hear anything" in response_text
+
+        # Should NOT have Hangup (call continues)
+        assert "<Hangup/>" not in response_text
+
+        # is_terminal should be False
+        assert CALL_RUNS["test-nonterminal"].is_terminal is False
+
+    @pytest.mark.asyncio
+    async def test_gather_after_terminal_returns_hangup(self, client: AsyncClient):
+        """Test that /twilio/gather returns immediate Hangup if call is already terminal."""
+        # Add a call run that is already terminal
+        call_run = CallRun(
+            call_id="test-terminal-gather",
+            conversation_id="conv-terminal-gather",
+            agent_type="STOCK_CHECKER",
+            phone_e164="+61731824583",
+            script_preview="Check stock for product.",
+            is_terminal=True,  # Already marked as terminal
+        )
+        CALL_RUNS["test-terminal-gather"] = call_run
+
+        # Call /twilio/gather (simulating a Twilio retry after terminal)
+        response = await client.post(
+            "/twilio/gather?conversationId=conv-terminal-gather&turn=3&retry=0",
+            data={"SpeechResult": "Hello?"}
+        )
+
+        assert response.status_code == 200
+        response_text = response.text
+
+        # Should just Hangup (no Say, no Gather, no Redirect)
+        assert "<Hangup/>" in response_text
+        assert "<Gather" not in response_text
+        assert "<Say" not in response_text

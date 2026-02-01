@@ -18,6 +18,7 @@ import com.calleroo.app.ui.screens.callsummary.CallSummaryScreen
 import com.calleroo.app.ui.screens.chat.UnifiedChatScreen
 import com.calleroo.app.ui.screens.placesearch.PlaceSearchScreen
 import com.calleroo.app.ui.screens.scheduledconfirmation.ScheduledConfirmationScreen
+import com.calleroo.app.ui.screens.scheduledtasks.ScheduledTasksScreen
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
@@ -39,7 +40,17 @@ fun CallerooNavHost() {
                     navController.navigate(
                         NavRoutes.TaskFlowGraph.createRoute(agentType, conversationId)
                     )
+                },
+                onNavigateToScheduledTasks = {
+                    navController.navigate(NavRoutes.ScheduledTasks.route)
                 }
+            )
+        }
+
+        // Scheduled Tasks screen - read-only list of scheduled tasks
+        composable(route = NavRoutes.ScheduledTasks.route) {
+            ScheduledTasksScreen(
+                onNavigateBack = { navController.popBackStack() }
             )
         }
 

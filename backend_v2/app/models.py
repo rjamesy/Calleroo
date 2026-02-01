@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 class AgentType(str, Enum):
     STOCK_CHECKER = "STOCK_CHECKER"
     RESTAURANT_RESERVATION = "RESTAURANT_RESERVATION"
+    SICK_CALLER = "SICK_CALLER"
+    CANCEL_APPOINTMENT = "CANCEL_APPOINTMENT"
 
 
 class NextAction(str, Enum):
@@ -28,6 +30,7 @@ class InputType(str, Enum):
     TIME = "TIME"
     BOOLEAN = "BOOLEAN"
     CHOICE = "CHOICE"
+    PHONE = "PHONE"
 
 
 class Confidence(str, Enum):
@@ -252,3 +255,32 @@ class CallStatusResponseV1(BaseModel):
     transcript: Optional[str] = None
     outcome: Optional[Dict[str, Any]] = None  # OpenAI analysis
     error: Optional[str] = None
+
+
+# ============================================================
+# Call Result Format Models (Post-call summary formatting)
+# ============================================================
+
+class CallResultFormatRequestV1(BaseModel):
+    """Request to format call results for display."""
+    agentType: str
+    callId: str
+    status: str
+    durationSeconds: Optional[int] = None
+    transcript: Optional[str] = None  # Raw Whisper transcript (fallback)
+    eventTranscript: Optional[List[str]] = None  # Event transcript with speaker labels (primary)
+    outcome: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    businessName: Optional[str] = None  # Name of business that was called
+
+
+class CallResultFormatResponseV1(BaseModel):
+    """Formatted call results for UI display."""
+    title: str  # e.g. "Call completed"
+    summary: Optional[str] = None  # 1-2 sentence plain-English summary
+    bullets: List[str]  # short bullet points (max 8)
+    extractedFacts: Dict[str, Any]  # pass-through from outcome
+    nextSteps: List[str]  # 1-4 action items
+    formattedTranscript: Optional[str] = None  # Cleaned conversation transcript
+    aiCallMade: bool
+    aiModel: str

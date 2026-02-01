@@ -1,3 +1,9 @@
-ec2-3-106-213-161.ap-southeast-2.compute.amazonaws.com {
+api.callerooapp.com {
+    encode gzip
     reverse_proxy api:8000
+}
+
+scheduler.callerooapp.com {
+    encode gzip
+    reverse_proxy scheduler:8090
 }

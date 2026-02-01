@@ -81,6 +81,33 @@ def compute_missing_required_fields(
         if not slots.get("time"):
             missing.append("time")
 
+    elif agent_type == "SICK_CALLER":
+        # Required: employer_name, employer_phone, caller_name, shift_date, shift_start_time OR shift_descriptor, reason_category
+        if not slots.get("employer_name"):
+            missing.append("employer_name")
+        if not slots.get("employer_phone"):
+            missing.append("employer_phone")
+        if not slots.get("caller_name"):
+            missing.append("caller_name")
+        if not slots.get("shift_date"):
+            missing.append("shift_date")
+        # Either shift_start_time or shift_descriptor is required
+        if not slots.get("shift_start_time") and not slots.get("shift_descriptor"):
+            missing.append("shift_start_time")
+        if not slots.get("reason_category"):
+            missing.append("reason_category")
+
+    elif agent_type == "CANCEL_APPOINTMENT":
+        # Required: business_name, appointment_day, appointment_time, customer_name
+        if not slots.get("business_name"):
+            missing.append("business_name")
+        if not slots.get("appointment_day"):
+            missing.append("appointment_day")
+        if not slots.get("appointment_time"):
+            missing.append("appointment_time")
+        if not slots.get("customer_name"):
+            missing.append("customer_name")
+
     return missing
 
 
@@ -103,7 +130,7 @@ Your task is to generate THREE things based on the provided context:
 3. confirmationChecklist: 3-5 items the user should verify before the call starts
 
 CONTEXT FORMAT:
-- agentType: "STOCK_CHECKER" or "RESTAURANT_RESERVATION"
+- agentType: "STOCK_CHECKER", "RESTAURANT_RESERVATION", "SICK_CALLER", or "CANCEL_APPOINTMENT"
 - place: Business being called (name, address, phone)
 - slots: Collected information (product, quantity, date, time, etc.)
 - disclosure: User preferences (nameShare, phoneShare)
@@ -117,6 +144,8 @@ SCRIPT PREVIEW RULES:
 5. Keep it natural and conversational
 6. For STOCK_CHECKER: Ask about product availability, quantity, and any relevant details
 7. For RESTAURANT_RESERVATION: Request a reservation for party_size on date at time
+8. For SICK_CALLER: Notify employer that user is unwell and cannot attend their shift
+9. For CANCEL_APPOINTMENT: Request cancellation of existing appointment
 
 CHECKLIST RULES:
 1. Include 3-5 actionable items

@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  scheduler:
+    build: .
+    container_name: calleroo-scheduler
+    ports:
+      - "8090:8090"
+    environment:
+      - PORT=8090
+      - DATABASE_PATH=/data/scheduler.db
+      - BACKEND_INTERNAL_TOKEN=${BACKEND_INTERNAL_TOKEN:-}
+      - DEFAULT_BACKEND_BASE_URL=${DEFAULT_BACKEND_BASE_URL:-https://api.callerooapp.com}
+      - POLL_INTERVAL=${POLL_INTERVAL:-3.0}
+    volumes:
+      - scheduler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  scheduler-data:
+    driver: local

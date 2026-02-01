@@ -22,7 +22,9 @@ import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.EventBusy
 import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.Restaurant
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Button
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,7 +50,8 @@ import java.util.UUID
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AgentSelectScreen(
-    onAgentSelected: (AgentType, String) -> Unit
+    onAgentSelected: (AgentType, String) -> Unit,
+    onNavigateToScheduledTasks: () -> Unit
 ) {
     var selectedAgent by remember { mutableStateOf<AgentType?>(null) }
 
@@ -87,6 +90,14 @@ fun AgentSelectScreen(
                         text = "Calleroo",
                         fontWeight = FontWeight.Bold
                     )
+                },
+                actions = {
+                    IconButton(onClick = onNavigateToScheduledTasks) {
+                        Icon(
+                            imageVector = Icons.Default.Schedule,
+                            contentDescription = "Scheduled Tasks"
+                        )
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface

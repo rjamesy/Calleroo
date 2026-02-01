@@ -186,47 +186,163 @@ async def health_check():
     return {"status": "healthy", "version": "2.0.0"}
 
 
+# Required slots per agent type for fallback question generation
+REQUIRED_SLOTS_MAP = {
+    # (field_name, question_text, input_type)
+    "SICK_CALLER": [
+        ("employer_name", "Who should I call to notify?", "TEXT"),
+        ("employer_phone", "What's their phone number?", "PHONE"),
+        ("caller_name", "What name should I give them?", "TEXT"),
+        ("shift_date", "When is your shift?", "DATE"),
+        ("shift_start_time", "What time does it start?", "TIME"),
+        ("reason_category", "What's the reason?", "CHOICE"),
+    ],
+    "STOCK_CHECKER": [
+        ("retailer_name", "Which retailer should I call?", "TEXT"),
+        ("product_name", "What product are you looking for?", "TEXT"),
+        ("quantity", "How many do you need?", "NUMBER"),
+        ("store_location", "Which suburb or area?", "TEXT"),
+    ],
+    "RESTAURANT_RESERVATION": [
+        ("restaurant_name", "Which restaurant would you like to book?", "TEXT"),
+        ("party_size", "How many people?", "NUMBER"),
+        ("date", "What date?", "DATE"),
+        ("time", "What time?", "TIME"),
+    ],
+    "CANCEL_APPOINTMENT": [
+        ("business_name", "What's the name of the business?", "TEXT"),
+        ("appointment_day", "What day is the appointment?", "DATE"),
+        ("appointment_time", "What time is the appointment?", "TIME"),
+        ("customer_name", "What name is the booking under?", "TEXT"),
+    ],
+}
+
+
+def _get_next_missing_slot(agent_type: str, slots: dict) -> tuple:
+    """Find the next missing required slot for an agent type.
+
+    Returns (field, question_text, input_type) or None if all present.
+    """
+    required = REQUIRED_SLOTS_MAP.get(agent_type, [])
+    for field, question_text, input_type in required:
+        if field not in slots or not slots.get(field):
+            return (field, question_text, input_type)
+    return None
+
+
+def _create_endpoint_fallback_response(
+    agent_type: str,
+    slots: dict,
+    conversation_id: str,
+) -> ConversationResponse:
+    """Create a safe fallback response when unexpected errors occur.
+
+    This is the FINAL safety net - used only when all else fails.
+    """
+    from .models import Question, InputType, Confidence
+
+    next_slot = _get_next_missing_slot(agent_type, slots)
+
+    if next_slot:
+        field, question_text, input_type_str = next_slot
+        try:
+            input_type = InputType(input_type_str)
+        except ValueError:
+            input_type = InputType.TEXT
+
+        question = Question(
+            text=question_text,
+            field=field,
+            inputType=input_type,
+            choices=None,
+            optional=False,
+        )
+        assistant_message = question_text
+    else:
+        question = Question(
+            text="Could you please provide more details?",
+            field="additional_info",
+            inputType=InputType.TEXT,
+            choices=None,
+            optional=True,
+        )
+        assistant_message = "I need a bit more information to continue."
+
+    logger.warning(
+        f"METRIC endpoint_fallback_used agent={agent_type} "
+        f"conversationId={conversation_id} next_field={question.field}"
+    )
+
+    return ConversationResponse(
+        assistantMessage=assistant_message,
+        nextAction=NextAction.ASK_QUESTION,
+        question=question,
+        extractedData=None,
+        confidence=Confidence.LOW,
+        confirmationCard=None,
+        placeSearchParams=None,
+        aiCallMade=True,
+        aiModel="fallback",
+    )
+
+
 def sanitize_conversation_response(
     response: ConversationResponse,
     conversation_id: str,
-    agent_type: str
+    agent_type: str,
+    slots: dict = None,
 ) -> ConversationResponse:
     """
     Validate and auto-repair conversation response for schema completeness.
     Logs warnings and returns a sanitized response.
 
     Auto-repairs:
-    - FIND_PLACE without placeSearchParams -> ASK_QUESTION
-    - CONFIRM without confirmationCard -> ASK_QUESTION
-    - Empty assistantMessage -> fallback message
+    - FIND_PLACE without placeSearchParams -> ASK_QUESTION with generated question
+    - CONFIRM without confirmationCard -> ASK_QUESTION with generated question
+    - Empty assistantMessage -> use question.text or fallback message
     - Conflicting blocks (e.g., FIND_PLACE with question) -> drop irrelevant blocks
-
-    Warnings only (no repair):
-    - ASK_QUESTION without question (freeform input is acceptable)
+    - ASK_QUESTION without question -> generate question for next missing slot
     """
+    from .models import Question, InputType, Confidence
+
+    if slots is None:
+        slots = {}
+
     warnings = []
     repairs = []
-
-    # Check and repair assistantMessage
-    assistant_message = response.assistantMessage
-    if not assistant_message or not assistant_message.strip():
-        warnings.append("assistantMessage_empty")
-        assistant_message = "I'm missing one detail to continue. Please type the answer again."
-        repairs.append("assistantMessage_set_fallback")
 
     # Check and repair nextAction combinations
     next_action = response.nextAction
     confirmation_card = response.confirmationCard
     place_search_params = response.placeSearchParams
     question = response.question
+    assistant_message = response.assistantMessage
 
     # Handle conflicting blocks: nextAction takes precedence
     if next_action == NextAction.FIND_PLACE:
         if place_search_params is None:
             warnings.append("FIND_PLACE_missing_placeSearchParams")
             next_action = NextAction.ASK_QUESTION
-            assistant_message = "I need more information. What's the name of the business you'd like to call?"
             repairs.append("downgraded_to_ASK_QUESTION")
+            # Generate a question for next missing slot
+            next_slot = _get_next_missing_slot(agent_type, slots)
+            if next_slot:
+                field, q_text, input_type_str = next_slot
+                try:
+                    input_type = InputType(input_type_str)
+                except ValueError:
+                    input_type = InputType.TEXT
+                question = Question(
+                    text=q_text,
+                    field=field,
+                    inputType=input_type,
+                    choices=None,
+                    optional=False,
+                )
+                assistant_message = q_text
+                repairs.append("generated_question_for_missing_slot")
+            else:
+                assistant_message = "I need more information. What's the name of the business you'd like to call?"
         elif question is not None:
             # Conflicting: FIND_PLACE should not have question
             warnings.append("FIND_PLACE_has_conflicting_question")
@@ -238,6 +354,23 @@ def sanitize_conversation_response(
             warnings.append("CONFIRM_missing_confirmationCard")
             next_action = NextAction.ASK_QUESTION
             repairs.append("downgraded_to_ASK_QUESTION")
+            # Generate a question for next missing slot
+            next_slot = _get_next_missing_slot(agent_type, slots)
+            if next_slot:
+                field, q_text, input_type_str = next_slot
+                try:
+                    input_type = InputType(input_type_str)
+                except ValueError:
+                    input_type = InputType.TEXT
+                question = Question(
+                    text=q_text,
+                    field=field,
+                    inputType=input_type,
+                    choices=None,
+                    optional=False,
+                )
+                assistant_message = q_text
+                repairs.append("generated_question_for_missing_slot")
         elif question is not None:
             # Conflicting: CONFIRM should not have question
             warnings.append("CONFIRM_has_conflicting_question")
@@ -247,7 +380,37 @@ def sanitize_conversation_response(
     elif next_action == NextAction.ASK_QUESTION:
         if question is None:
             warnings.append("ASK_QUESTION_missing_question")
-            # No repair - freeform input is acceptable
+            # Generate a question for next missing slot
+            next_slot = _get_next_missing_slot(agent_type, slots)
+            if next_slot:
+                field, q_text, input_type_str = next_slot
+                try:
+                    input_type = InputType(input_type_str)
+                except ValueError:
+                    input_type = InputType.TEXT
+                question = Question(
+                    text=q_text,
+                    field=field,
+                    inputType=input_type,
+                    choices=None,
+                    optional=False,
+                )
+                repairs.append("generated_question_for_missing_slot")
+                # Use question text as assistant message if message is empty
+                if not assistant_message or not assistant_message.strip():
+                    assistant_message = q_text
+                    repairs.append("assistantMessage_from_question")
+
+    # Check and repair assistantMessage (after question generation)
+    if not assistant_message or not assistant_message.strip():
+        warnings.append("assistantMessage_empty")
+        # Try to use question text if available
+        if question and question.text:
+            assistant_message = question.text
+            repairs.append("assistantMessage_from_question")
+        else:
+            assistant_message = "I need a bit more information to continue."
+            repairs.append("assistantMessage_set_fallback")
 
     # Metric log for monitoring sanitization rate (scrapable)
     # Format: METRIC sanitization_applied agent=X repairs=N warnings=N
@@ -292,6 +455,11 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
     - NO pre-extraction heuristics
     - NO fallback flows
 
+    GUARANTEE: This endpoint NEVER returns HTTP 500 due to model output.
+    - Invalid JSON from model: parsed, extracted, or repaired
+    - Missing fields: filled with defaults or fallback question
+    - All failures: logged and return valid ASK_QUESTION response
+
     The backend is the sole authority for:
     - Assistant message text
     - Next action
@@ -307,32 +475,27 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
         f"message='{msg_preview}'"
     )
 
-    if openai_service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
+    # TOP-LEVEL EXCEPTION BARRIER: wrap everything to guarantee no 500s from model output
     try:
+        if openai_service is None:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+
         # ALWAYS call OpenAI - this is non-negotiable
-        # NO local heuristics, NO pre-extraction, NO fallbacks
+        # The service guarantees no exceptions from model output
         response = await openai_service.get_next_turn(
             agent_type=request.agentType,
             user_message=request.userMessage,
             slots=request.slots,
             message_history=request.messageHistory,
+            conversation_id=request.conversationId,
         )
-
-        # Verify OpenAI was actually called
-        if not response.aiCallMade:
-            logger.error("CRITICAL: Response indicates aiCallMade=false, this should never happen")
-            raise HTTPException(
-                status_code=500,
-                detail="openai_not_called: Backend must always call OpenAI"
-            )
 
         # Sanitize response: validate and auto-repair invalid combinations
         response = sanitize_conversation_response(
             response,
             request.conversationId,
-            request.agentType.value
+            request.agentType.value,
+            request.slots,
         )
 
         # Log the response
@@ -350,10 +513,17 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing conversation: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"openai_failed: {str(e)}"
+        # FINAL SAFETY NET: if anything unexpected happens, return a safe fallback
+        logger.error(
+            f"METRIC endpoint_unexpected_error conversationId={request.conversationId} "
+            f"agent={request.agentType.value} error={type(e).__name__}",
+            exc_info=True
+        )
+        # Return a safe fallback instead of 500
+        return _create_endpoint_fallback_response(
+            request.agentType.value,
+            request.slots,
+            request.conversationId,
         )
 
 

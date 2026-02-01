@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  api:
+    build: ./backend_v2
+    container_name: calleroo-backend-v2
+    env_file: ./backend_v2/.env
+    expose:
+      - "8000"
+    restart: unless-stopped
+    networks:
+      - calleroo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2
+    container_name: calleroo-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./backend_v2/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - calleroo-net
+    depends_on:
+      - api
+      - scheduler
+
+  scheduler:
+    build: ./calleroo_scheduler
+    container_name: calleroo-scheduler
+    expose:
+      - "8090"
+    environment:
+      - PORT=8090
+      - DATABASE_PATH=/data/scheduler.db
+      - DEFAULT_BACKEND_BASE_URL=https://api.callerooapp.com
+      - POLL_INTERVAL=3.0
+    volumes:
+      - scheduler-data:/data
+    restart: unless-stopped
+    networks:
+      - calleroo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  caddy_data:
+  caddy_config:
+  scheduler-data:
+
+networks:
+  calleroo-net:
+    driver: bridge

@@ -26,7 +26,7 @@ android {
         buildConfigField("String", "BACKEND_BASE_URL", "\"https://api.callerooapp.com\"")
 
         // Scheduler URL - Empty string disables scheduling feature
-        buildConfigField("String", "SCHEDULER_BASE_URL", "\"\"")
+        buildConfigField("String", "SCHEDULER_BASE_URL", "\"https://scheduler.callerooapp.com\"")
     }
 
     buildTypes {
