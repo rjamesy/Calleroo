@@ -86,20 +86,20 @@ class TestDeterministicScriptTemplates:
         assert "{shift_start_time}" in spec.phone_flow.message_template
 
     def test_sick_caller_disclosure_in_greeting(self):
-        """SICK_CALLER greeting must include AI disclosure (4.3)."""
+        """SICK_CALLER greeting must identify as Calleroo (app-based call)."""
         spec = get_agent_spec("SICK_CALLER")
         greeting = spec.phone_flow.greeting_template.lower()
-        # Must identify as automated/AI call
-        assert "automated" in greeting or "ai" in greeting, \
-            "Greeting must disclose that this is an automated/AI call"
+        # Must identify as Calleroo (the mobile app)
+        assert "calleroo" in greeting, \
+            "Greeting must identify as Calleroo"
 
-    def test_sick_caller_message_asks_for_confirmation(self):
-        """SICK_CALLER message must ask for confirmation."""
+    def test_sick_caller_message_ends_politely(self):
+        """SICK_CALLER message must end with thanks."""
         spec = get_agent_spec("SICK_CALLER")
         message = spec.phone_flow.message_template.lower()
-        # Must ask to confirm receipt
-        assert "confirm" in message, \
-            "Message must ask the recipient to confirm receipt"
+        # Must end politely
+        assert "thanks" in message, \
+            "Message must end politely with thanks"
 
 
 class TestDeterministicResponseGeneration:

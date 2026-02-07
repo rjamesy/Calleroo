@@ -1,5 +1,6 @@
 package com.calleroo.app.ui.screens.chat
 
+import com.calleroo.app.domain.model.AgentMeta
 import com.calleroo.app.domain.model.AgentType
 import com.calleroo.app.domain.model.ConfirmationCard
 import com.calleroo.app.domain.model.NextAction
@@ -37,7 +38,8 @@ data class ChatUiState(
     val isConfirmationSubmitting: Boolean = false,  // True while awaiting CONFIRM/REJECT response
     val error: String? = null,
     val isComplete: Boolean = false,
-    val placeSearchParams: PlaceSearchParams? = null
+    val placeSearchParams: PlaceSearchParams? = null,
+    val agentMeta: AgentMeta? = null  // Agent metadata for generic UI handling
 ) {
     val showConfirmationCard: Boolean
         get() = nextAction == NextAction.CONFIRM && confirmationCard != null

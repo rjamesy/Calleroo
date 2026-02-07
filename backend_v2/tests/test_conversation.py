@@ -1334,9 +1334,12 @@ class TestSlotMergeBug:
         assert sanitized.question is not None
         assert sanitized.question.field == "shift_date", \
             f"Expected shift_date, got {sanitized.question.field}"
-        # extractedData should be normalized to {} (never null)
+        # extractedData should contain existing slots (never null, merged with existing)
         assert sanitized.extractedData is not None
-        assert sanitized.extractedData == {}
+        # The existing slots are preserved in extractedData
+        assert sanitized.extractedData.get("caller_name") == "Richard"
+        assert sanitized.extractedData.get("employer_name") == "Bunnings"
+        assert sanitized.extractedData.get("employer_phone") == "+61412345678"
 
     def test_merged_slots_used_for_next_missing(self):
         """Test that mergedSlots (existing + extracted) is used to compute next question.

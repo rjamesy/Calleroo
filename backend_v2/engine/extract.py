@@ -360,7 +360,13 @@ def build_extraction_prompt(
             slot_def += f" [allowed values: {choices_str}]"
         slot_definitions.append(slot_def)
 
+    # Include current date for resolving relative dates like "tomorrow"
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d (%A)")
+
     prompt = f"""Extract slot values from the user message.
+
+TODAY'S DATE: {today_str}
 
 SLOTS TO EXTRACT:
 {chr(10).join(slot_definitions)}
@@ -375,7 +381,7 @@ INSTRUCTIONS:
 1. Extract ONLY the slots that have values in the user message
 2. Use the EXACT slot names listed above
 3. For CHOICE slots, use ONLY the allowed values
-4. For DATE, use ISO format (YYYY-MM-DD)
+4. For DATE, use ISO format (YYYY-MM-DD). Use TODAY'S DATE above to resolve relative dates like "today", "tomorrow", "next Monday"
 5. For TIME, use 24-hour format (HH:MM)
 6. For PHONE, normalize to E.164 format if possible (+61...)
 7. Do NOT include slots that aren't mentioned

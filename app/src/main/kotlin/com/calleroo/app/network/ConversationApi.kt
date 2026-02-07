@@ -22,7 +22,7 @@ import retrofit2.http.Path
 
 interface ConversationApi {
 
-    @POST("/conversation/next")
+    @POST("/v2/conversation/next")
     suspend fun nextTurn(@Body request: ConversationRequest): ConversationResponse
 
     @POST("/places/search")

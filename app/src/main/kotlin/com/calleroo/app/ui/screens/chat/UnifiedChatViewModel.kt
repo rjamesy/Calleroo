@@ -143,7 +143,8 @@ class UnifiedChatViewModel @Inject constructor(
                             isLoading = false,
                             isConfirmationSubmitting = false,
                             isComplete = sanitized.isComplete,
-                            placeSearchParams = sanitized.placeSearchParams
+                            placeSearchParams = sanitized.placeSearchParams,
+                            agentMeta = sanitized.agentMeta
                         )
                     }
                 },
@@ -240,7 +241,8 @@ class UnifiedChatViewModel @Inject constructor(
                             isLoading = false,
                             isConfirmationSubmitting = false,
                             isComplete = sanitized.isComplete,
-                            placeSearchParams = sanitized.placeSearchParams
+                            placeSearchParams = sanitized.placeSearchParams,
+                            agentMeta = sanitized.agentMeta
                         )
                     }
                 },
@@ -276,6 +278,9 @@ class UnifiedChatViewModel @Inject constructor(
      * Routes to the appropriate screen based on nextAction:
      * - FIND_PLACE: Navigate to PlaceSearch (requires placeSearchParams)
      * - COMPLETE: Navigate to CallSummary (for agents without place search, e.g., SICK_CALLER)
+     *
+     * DEFENSIVE: If nextAction=COMPLETE but phoneSource=PLACE and no place is resolved,
+     * route to PlaceSearch instead of CallSummary. This prevents the "No place selected" error.
      */
     fun handleContinue() {
         val state = _uiState.value
@@ -290,12 +295,53 @@ class UnifiedChatViewModel @Inject constructor(
                 }
             }
             NextAction.COMPLETE -> {
-                Log.i(TAG, "Continue -> CallSummary: conversationId=${state.conversationId}, agentType=${state.agentType}")
-                _navigateToCallSummary.value = true
+                // DEFENSIVE GUARD: For PLACE-based agents, verify we have a resolved place
+                // If not, route to PlaceSearch instead of CallSummary
+                val agentMeta = state.agentMeta
+                val hasPlace = hasResolvedPlace(state.slots)
+
+                if (agentMeta?.phoneSource == "PLACE" && !hasPlace) {
+                    // Place required but not resolved - route to PlaceSearch
+                    Log.w(TAG, "DEFENSIVE: nextAction=COMPLETE but phoneSource=PLACE and no resolved place. Routing to PlaceSearch.")
+                    // Try to construct placeSearchParams from slots
+                    val query = getSlotValue(state.slots, "retailer_name")
+                        ?: getSlotValue(state.slots, "restaurant_name")
+                        ?: getSlotValue(state.slots, "business_name")
+                        ?: ""
+                    val area = getSlotValue(state.slots, "store_location")
+                        ?: getSlotValue(state.slots, "suburb_or_area")
+                        ?: getSlotValue(state.slots, "business_location")
+                        ?: "Australia"
+                    _navigateToPlaceSearch.value = Pair(query, area)
+                } else {
+                    Log.i(TAG, "Continue -> CallSummary: conversationId=${state.conversationId}, agentType=${state.agentType}")
+                    _navigateToCallSummary.value = true
+                }
             }
             else -> {
                 Log.w(TAG, "Continue clicked but nextAction=${state.nextAction} not handled")
             }
+        }
+    }
+
+    /**
+     * Check if slots contain a resolved place (place_id + place_phone).
+     */
+    private fun hasResolvedPlace(slots: JsonObject): Boolean {
+        val placeId = getSlotValue(slots, "place_id")
+        val placePhone = getSlotValue(slots, "place_phone")
+        return !placeId.isNullOrBlank() && !placePhone.isNullOrBlank()
+    }
+
+    /**
+     * Get a slot value as String from JsonObject.
+     */
+    private fun getSlotValue(slots: JsonObject, key: String): String? {
+        val element = slots[key] ?: return null
+        return if (element is JsonPrimitive && element.isString) {
+            element.content
+        } else {
+            element.toString().trim('"')
         }
     }
 
@@ -434,7 +480,8 @@ class UnifiedChatViewModel @Inject constructor(
             placeSearchParams = if (sanitizedAction == NextAction.FIND_PLACE) response.placeSearchParams else null,
             isComplete = sanitizedAction == NextAction.COMPLETE,
             wasSanitized = sanitizationReasons.isNotEmpty(),
-            sanitizationReasons = sanitizationReasons
+            sanitizationReasons = sanitizationReasons,
+            agentMeta = response.agentMeta
         )
     }
 
@@ -450,6 +497,7 @@ class UnifiedChatViewModel @Inject constructor(
         val placeSearchParams: com.calleroo.app.domain.model.PlaceSearchParams?,
         val isComplete: Boolean,
         val wasSanitized: Boolean = false,
-        val sanitizationReasons: List<String> = emptyList()
+        val sanitizationReasons: List<String> = emptyList(),
+        val agentMeta: com.calleroo.app.domain.model.AgentMeta? = null
     )
 }

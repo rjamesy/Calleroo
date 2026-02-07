@@ -35,6 +35,7 @@ from engine.planner import (
     get_missing_required_slots,
     NextAction as PlannerNextAction,
     PlannerResult,
+    CONFIRMED_DETAILS_FLAG,
 )
 from engine.extract import extract_slots, ExtractionResult
 
@@ -335,17 +336,34 @@ async def process_conversation_v2(
         # Get existing slots
         existing_slots = request.slots if request.slots else {}
 
-        # Handle CONFIRM action deterministically
+        # Handle CONFIRM action - use planner to decide FIND_PLACE vs COMPLETE
         if request.clientAction == ClientAction.CONFIRM:
             logger.info(f"[V2] Client action: CONFIRM")
+
+            # Run planner to decide next action (handles place resolution check)
+            planner_result = decide_next_action(
+                spec=spec,
+                slots=existing_slots,
+                client_action="CONFIRM",
+            )
+
+            # Build response based on planner decision
+            response_slots = {**existing_slots}
+
+            # If planner returns FIND_PLACE, set the confirmed flag
+            # This prevents showing another confirmation after place selection
+            if planner_result.next_action == PlannerNextAction.FIND_PLACE:
+                response_slots[CONFIRMED_DETAILS_FLAG] = True
+                logger.info(f"[V2] CONFIRM => FIND_PLACE, setting {CONFIRMED_DETAILS_FLAG}=true")
+
             response = ConversationResponse(
-                assistantMessage="Great! I'll place the call now.",
-                nextAction=NextAction.COMPLETE,
+                assistantMessage=planner_result.assistant_message,
+                nextAction=_planner_action_to_api_action(planner_result.next_action),
                 question=None,
-                extractedData=existing_slots,  # Preserve all slots
+                extractedData=response_slots,  # Preserve all slots + flag
                 confidence=Confidence.HIGH,
                 confirmationCard=None,
-                placeSearchParams=None,
+                placeSearchParams=_planner_to_api_place_search_params(planner_result.place_search_params),
                 agentMeta=agent_meta,  # ALWAYS present
                 aiCallMade=False,
                 aiModel="deterministic",
@@ -353,7 +371,7 @@ async def process_conversation_v2(
             )
             if request.idempotencyKey:
                 _store_idempotent_response(request.idempotencyKey, response)
-            _metrics.record_request(llm_used=False, next_action="COMPLETE")
+            _metrics.record_request(llm_used=False, next_action=planner_result.next_action.value)
             return response
 
         # Handle REJECT action deterministically

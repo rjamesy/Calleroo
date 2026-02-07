@@ -156,7 +156,7 @@ class TestTwilioVoiceWebhook:
 
     @pytest.mark.asyncio
     async def test_returns_twiml(self, client: AsyncClient):
-        """Test that voice webhook returns TwiML XML."""
+        """Test that voice webhook returns TwiML XML with Gather for speech input."""
         # Add a call run for the conversation
         call_run = CallRun(
             call_id="twilio-sid-789",
@@ -172,17 +172,19 @@ class TestTwilioVoiceWebhook:
         assert response.status_code == 200
         assert "application/xml" in response.headers["content-type"]
         assert "<Response>" in response.text
-        assert "<Say" in response.text
-        assert "Hello, I am calling about a product." in response.text
+        # New behavior: Gather-based flow for bidirectional speech
+        assert "<Gather" in response.text
+        assert "/twilio/gather" in response.text
 
     @pytest.mark.asyncio
     async def test_unknown_conversation_returns_fallback(self, client: AsyncClient):
-        """Test that unknown conversation returns fallback TwiML."""
+        """Test that unknown conversation returns TwiML (even if unknown)."""
         response = await client.post("/twilio/voice?conversationId=unknown")
 
         assert response.status_code == 200
         assert "<Response>" in response.text
-        assert "technical issue" in response.text
+        # New behavior: Returns Gather-based TwiML even for unknown conversations
+        assert "<Gather" in response.text
 
 
 class TestTwilioStatusWebhook:

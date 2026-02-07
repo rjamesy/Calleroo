@@ -26,6 +26,105 @@ from twilio.rest import Client as TwilioClient
 logger = logging.getLogger(__name__)
 
 
+def _get_phone_flow_mode(agent_type: str) -> str:
+    """Get the phone flow mode from AgentSpec.
+
+    Returns:
+        "DETERMINISTIC_SCRIPT" or "LLM_DIALOG"
+    """
+    try:
+        # Try relative import first (when running from backend_v2/)
+        from agents.specs import get_agent_spec
+        spec = get_agent_spec(agent_type)
+        return spec.phone_flow.mode.value
+    except ImportError:
+        try:
+            # Try absolute import (when running as package)
+            from backend_v2.agents.specs import get_agent_spec
+            spec = get_agent_spec(agent_type)
+            return spec.phone_flow.mode.value
+        except ImportError:
+            pass
+    except ValueError:
+        pass
+    # Fallback for legacy compatibility
+    if agent_type == "SICK_CALLER":
+        return "DETERMINISTIC_SCRIPT"
+    return "LLM_DIALOG"
+
+
+def _get_system_prompt_from_spec(agent_type: str, slots: Dict[str, Any]) -> str:
+    """Get the system prompt from AgentSpec with slot values injected.
+
+    Args:
+        agent_type: The agent type
+        slots: Current slot values
+
+    Returns:
+        The system prompt with slots substituted
+    """
+    spec = None
+    try:
+        # Try relative import first (when running from backend_v2/)
+        from agents.specs import get_agent_spec
+        spec = get_agent_spec(agent_type)
+    except ImportError:
+        try:
+            # Try absolute import (when running as package)
+            from backend_v2.agents.specs import get_agent_spec
+            spec = get_agent_spec(agent_type)
+        except ImportError:
+            pass
+
+    if spec is None:
+        # Fallback for legacy compatibility
+        return PHONE_AGENT_SYSTEM_PROMPT
+
+    if spec.phone_flow.mode.value == "DETERMINISTIC_SCRIPT":
+        # For deterministic scripts, use a special prompt
+        greeting = spec.phone_flow.greeting_template or ""
+        message = spec.phone_flow.message_template or ""
+
+        # Substitute slot values
+        for slot in spec.slots_in_order:
+            placeholder = f"{{{slot.name}}}"
+            value = str(slots.get(slot.name, f"[{slot.name}]"))
+            greeting = greeting.replace(placeholder, value)
+            message = message.replace(placeholder, value)
+
+        # Build a deterministic prompt
+        prompt = f"""You are Calleroo, an AI assistant placing a short phone call.
+
+ABSOLUTE RULES:
+- Follow the exact call flow below. Do not deviate.
+- Keep turns short: 1 sentence per turn.
+- Do not ask open-ended questions.
+- End the call after goodbye. Never speak again.
+
+CALL FLOW:
+A) Greeting: "{greeting}"
+B) Message: "{message}"
+C) Closing: "Could you please confirm you've received that message?"
+D) If YES: "Thank you. Goodbye."
+   If NO / unsure: "No worries—could you please pass this message on? Thank you. Goodbye."
+E) After goodbye, never speak again.
+"""
+        return prompt
+
+    elif spec.phone_flow.system_prompt_template:
+        # Use the template from spec
+        prompt = spec.phone_flow.system_prompt_template
+        for slot in spec.slots_in_order:
+            placeholder = f"{{{slot.name}}}"
+            value = str(slots.get(slot.name, f"[{slot.name}]"))
+            prompt = prompt.replace(placeholder, value)
+        return prompt
+
+    else:
+        # Fall back to default phone agent prompt
+        return PHONE_AGENT_SYSTEM_PROMPT
+
+
 @dataclass
 class CallRun:
     """In-memory state for a single call run."""
@@ -813,15 +912,16 @@ class TwilioService:
             return "I'm sorry, I'm having technical difficulties. Please try again later."
 
         # ============================================================
-        # SICK_CALLER: Deterministic guard BEFORE calling OpenAI
+        # DETERMINISTIC_SCRIPT mode: Guard BEFORE calling OpenAI
         # If we've already asked for confirmation, force a terminal response
         # ============================================================
-        if call_run.agent_type == "SICK_CALLER" and call_run.message_confirm_asked:
+        flow_mode = _get_phone_flow_mode(call_run.agent_type)
+        if flow_mode == "DETERMINISTIC_SCRIPT" and call_run.message_confirm_asked:
             # Check for pass-on indicators first (wrong person)
             if _detect_pass_on(user_speech):
                 call_run.message_confirm_result = "PASS_ON"
                 call_run.is_terminal = True
-                logger.info(f"SICK_CALLER: Pass-on detected, ending call. Speech: {user_speech[:50]}...")
+                logger.info(f"{call_run.agent_type}: Pass-on detected, ending call. Speech: {user_speech[:50]}...")
                 return "No worries—could you please pass this message on? Thank you. Goodbye."
 
             # Check for YES/NO
@@ -829,41 +929,34 @@ class TwilioService:
             if yn == "YES":
                 call_run.message_confirm_result = "YES"
                 call_run.is_terminal = True
-                logger.info(f"SICK_CALLER: Confirmation received (YES), ending call. Speech: {user_speech[:50]}...")
+                logger.info(f"{call_run.agent_type}: Confirmation received (YES), ending call. Speech: {user_speech[:50]}...")
                 return "Thank you. Goodbye."
             if yn == "NO":
                 call_run.message_confirm_result = "NO"
                 call_run.is_terminal = True
-                logger.info(f"SICK_CALLER: Confirmation negative (NO), ending call. Speech: {user_speech[:50]}...")
+                logger.info(f"{call_run.agent_type}: Confirmation negative (NO), ending call. Speech: {user_speech[:50]}...")
                 return "No worries—could you please pass this message on? Thank you. Goodbye."
 
             # If unclear, let OpenAI handle but still constrained by prompt
-            logger.info(f"SICK_CALLER: Confirmation asked but response unclear, letting LLM handle: {user_speech[:50]}...")
+            logger.info(f"{call_run.agent_type}: Confirmation asked but response unclear, letting LLM handle: {user_speech[:50]}...")
 
         try:
             # Build conversation history from live_transcript
             transcript_text = "\n".join(call_run.live_transcript)
 
             # ============================================================
-            # Select system prompt by agent_type
+            # Select system prompt using AgentSpec (or legacy fallback)
             # ============================================================
-            system_prompt = PHONE_AGENT_SYSTEM_PROMPT
+            flow_mode = _get_phone_flow_mode(call_run.agent_type)
 
-            if call_run.agent_type == "SICK_CALLER":
-                # Use SICK_CALLER specific prompt with slot values injected
-                employer_name = str(call_run.slots.get("employer_name", "your workplace"))
-                caller_name = str(call_run.slots.get("caller_name", "the customer"))
-                shift_date = str(call_run.slots.get("shift_date", "your shift date"))
-                shift_start_time = str(call_run.slots.get("shift_start_time", "your shift time"))
-
-                system_prompt = (SICK_CALLER_PHONE_AGENT_PROMPT
-                    .replace("<employer_name>", employer_name)
-                    .replace("<caller_name>", caller_name)
-                    .replace("<shift_date>", shift_date)
-                    .replace("<shift_start_time>", shift_start_time)
-                )
-
-                logger.info(f"SICK_CALLER: Using dedicated prompt with slots: employer={employer_name}, caller={caller_name}")
+            if flow_mode == "DETERMINISTIC_SCRIPT":
+                # Use spec-driven prompt with slot values injected
+                system_prompt = _get_system_prompt_from_spec(call_run.agent_type, call_run.slots)
+                logger.info(f"{call_run.agent_type}: Using DETERMINISTIC_SCRIPT mode with spec-driven prompt")
+            else:
+                # Use LLM_DIALOG mode with spec or legacy prompt
+                system_prompt = _get_system_prompt_from_spec(call_run.agent_type, call_run.slots)
+                logger.info(f"{call_run.agent_type}: Using LLM_DIALOG mode")
 
             # Build user message with context
             user_message = f"""Conversation so far:
@@ -898,25 +991,25 @@ What should you say next?"""
             content = content.strip().strip('"').strip("'")
 
             # ============================================================
-            # SICK_CALLER: Mark confirmation asked if LLM asked it
+            # DETERMINISTIC_SCRIPT mode: Mark confirmation asked if LLM asked it
             # ============================================================
-            if call_run.agent_type == "SICK_CALLER":
+            if flow_mode == "DETERMINISTIC_SCRIPT":
                 content_lower = content.lower()
                 if ("confirm" in content_lower and "received" in content_lower) or \
                    ("confirm" in content_lower and "message" in content_lower) or \
                    "is that okay" in content_lower or \
                    "did you get that" in content_lower:
                     call_run.message_confirm_asked = True
-                    logger.info(f"SICK_CALLER: Marked message_confirm_asked=True. Response: {content[:50]}...")
+                    logger.info(f"{call_run.agent_type}: Marked message_confirm_asked=True. Response: {content[:50]}...")
 
                 # Detect goodbye - mark terminal
                 if "goodbye" in content_lower or "good bye" in content_lower:
                     call_run.is_terminal = True
-                    logger.info(f"SICK_CALLER: Goodbye detected, marked terminal. Response: {content[:50]}...")
+                    logger.info(f"{call_run.agent_type}: Goodbye detected, marked terminal. Response: {content[:50]}...")
 
-            # Deterministic guard: prevent repeating the same question (non-SICK_CALLER)
-            # For SICK_CALLER, the deterministic guard above handles this
-            if call_run.agent_type != "SICK_CALLER":
+            # LLM_DIALOG mode: prevent repeating the same question
+            # For DETERMINISTIC_SCRIPT mode, the deterministic guard above handles this
+            if flow_mode != "DETERMINISTIC_SCRIPT":
                 # But ALLOW repeat if user provided new info (numbers, yes/no, prices)
                 new_question = self._extract_question(content)
                 if new_question and call_run.last_question:

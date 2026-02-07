@@ -101,29 +101,116 @@ def is_slot_filled(slots: Dict[str, Any], slot_name: str) -> bool:
     return True
 
 
+# =============================================================================
+# PLACE RESOLUTION CHECKING
+# =============================================================================
+
+# Canonical slot names for resolved place data
+# These are written by the Android app after PlaceSearch/PlaceDetails flow
+PLACE_ID_SLOT = "place_id"
+PLACE_PHONE_SLOT = "place_phone"  # E.164 format
+
+# Internal flag to track if user has confirmed core details (before place selection)
+# This prevents showing a second confirmation card after place selection
+CONFIRMED_DETAILS_FLAG = "_confirmed_core_details"
+
+
+def is_place_resolved(slots: Dict[str, Any]) -> bool:
+    """
+    Check if a place has been resolved (selected from search).
+
+    A place is considered resolved when we have both:
+    - place_id: The Google Places ID
+    - place_phone: The phone number in E.164 format
+
+    This is required for phoneSource=PLACE agents before COMPLETE.
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if place is resolved with both ID and phone
+    """
+    place_id = slots.get(PLACE_ID_SLOT)
+    place_phone = slots.get(PLACE_PHONE_SLOT)
+
+    has_place_id = place_id is not None and str(place_id).strip() != ""
+    has_place_phone = place_phone is not None and str(place_phone).strip() != ""
+
+    return has_place_id and has_place_phone
+
+
+def has_confirmed_details(slots: Dict[str, Any]) -> bool:
+    """
+    Check if user has already confirmed core details.
+
+    This flag is set when user confirms the details, before place search.
+    It prevents showing a second confirmation card after place selection.
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if core details have been confirmed
+    """
+    flag = slots.get(CONFIRMED_DETAILS_FLAG)
+    return flag is True or flag == "true" or flag == True
+
+
+def _is_required_now(slot_spec: SlotSpec, slots: Dict[str, Any]) -> bool:
+    """
+    Check if a slot is required at this moment.
+
+    A slot is required if:
+    - slot_spec.required == True (always required)
+    - OR slot_spec.required_if(slots) == True (conditionally required)
+
+    Args:
+        slot_spec: The slot specification
+        slots: Current slot values
+
+    Returns:
+        True if the slot is required now
+    """
+    return slot_spec.required or (slot_spec.required_if is not None and slot_spec.required_if(slots))
+
+
 def get_next_slot(spec: AgentSpec, slots: Dict[str, Any]) -> Optional[SlotSpec]:
     """
     Get the next slot that needs to be filled.
 
-    Returns the first required slot that is not yet filled, in order.
-    If all required slots are filled, returns None.
+    Processing order:
+    1. Required slots (static or conditional) that are not filled (in order)
+    2. Optional slots with ask_if predicate that returns True and not filled
 
     Args:
         spec: The agent specification
         slots: Current slot values
 
     Returns:
-        The next SlotSpec to ask for, or None if all required slots are filled
+        The next SlotSpec to ask for, or None if all applicable slots are filled
     """
     for slot_spec in spec.slots_in_order:
-        if slot_spec.required and not is_slot_filled(slots, slot_spec.name):
+        # Skip already filled slots
+        if is_slot_filled(slots, slot_spec.name):
+            continue
+
+        # Check if required now (static or conditional)
+        if _is_required_now(slot_spec, slots):
             return slot_spec
+
+        # Optional slots with ask_if: check predicate
+        if slot_spec.ask_if is not None and slot_spec.should_ask(slots):
+            return slot_spec
+
     return None
 
 
 def get_missing_required_slots(spec: AgentSpec, slots: Dict[str, Any]) -> List[str]:
     """
     Get list of required slot names that are missing.
+
+    Includes both statically required and conditionally required slots.
 
     Args:
         spec: The agent specification
@@ -134,7 +221,7 @@ def get_missing_required_slots(spec: AgentSpec, slots: Dict[str, Any]) -> List[s
     """
     missing = []
     for slot_spec in spec.slots_in_order:
-        if slot_spec.required and not is_slot_filled(slots, slot_spec.name):
+        if _is_required_now(slot_spec, slots) and not is_slot_filled(slots, slot_spec.name):
             missing.append(slot_spec.name)
     return missing
 
@@ -259,6 +346,8 @@ def build_confirmation_card(spec: AgentSpec, slots: Dict[str, Any]) -> Confirmat
     """
     Build a confirmation card from the AgentSpec template and current slots.
 
+    Lines with empty or "(not provided)" values are omitted for cleaner display.
+
     Args:
         spec: The agent specification
         slots: Current slot values
@@ -272,11 +361,21 @@ def build_confirmation_card(spec: AgentSpec, slots: Dict[str, Any]) -> Confirmat
         formatted_line = line_template
         # Find all {slot_name} placeholders and replace them
         placeholders = re.findall(r'\{(\w+)\}', line_template)
+        skip_line = False
         for placeholder in placeholders:
-            value = slots.get(placeholder, "(not provided)")
+            value = slots.get(placeholder)
             display_value = format_slot_value_for_display(placeholder, value)
+
+            # Check if value is empty/not provided/not sure
+            if value is None or str(value).strip() == "" or str(value).strip().lower() in ("not sure", "not_sure", "unsure"):
+                skip_line = True
+                break
+
             formatted_line = formatted_line.replace(f"{{{placeholder}}}", display_value)
-        formatted_lines.append(formatted_line)
+
+        # Only add line if it has meaningful content
+        if not skip_line:
+            formatted_lines.append(formatted_line)
 
     # Generate stable card ID from content hash
     card_content = f"{spec.confirm_title}|{'|'.join(formatted_lines)}"
@@ -299,21 +398,58 @@ def build_place_search_params(spec: AgentSpec, slots: Dict[str, Any]) -> PlaceSe
     """
     Build place search parameters from the AgentSpec and current slots.
 
+    GUARANTEE: Always returns non-empty query and area.
+    - Query priority: place_query_slot value -> "store" (fallback)
+    - Area priority: place_area_slot value -> "Australia" (fallback)
+
     Args:
         spec: The agent specification
         slots: Current slot values
 
     Returns:
-        PlaceSearchParams object for the response
+        PlaceSearchParams object with non-empty query and area
     """
-    query = "business"  # Default
-    area = "Australia"  # Default
+    query = ""
+    area = ""
 
+    # Try to get query from spec's place_query_slot
     if spec.place_query_slot:
-        query = str(slots.get(spec.place_query_slot, query))
+        slot_value = slots.get(spec.place_query_slot)
+        if slot_value is not None:
+            query = str(slot_value).strip()
 
+    # Try to get area from spec's place_area_slot
     if spec.place_area_slot:
-        area = str(slots.get(spec.place_area_slot, area))
+        slot_value = slots.get(spec.place_area_slot)
+        if slot_value is not None:
+            area = str(slot_value).strip()
+
+    # Fallback: ensure query is never empty
+    if not query:
+        # Try common slot names as fallback
+        for fallback_slot in ["retailer_name", "restaurant_name", "business_name"]:
+            slot_value = slots.get(fallback_slot)
+            if slot_value:
+                query = str(slot_value).strip()
+                break
+
+    # Final fallback for query
+    if not query:
+        query = "store"
+        logger.warning(f"build_place_search_params: No query slot found, using fallback 'store'")
+
+    # Fallback: ensure area is never empty
+    if not area:
+        # Try common area slot names as fallback
+        for fallback_slot in ["store_location", "suburb_or_area", "business_location", "location"]:
+            slot_value = slots.get(fallback_slot)
+            if slot_value:
+                area = str(slot_value).strip()
+                break
+
+    # Final fallback for area
+    if not area:
+        area = "Australia"
 
     return PlaceSearchParams(query=query, area=area)
 
@@ -335,12 +471,23 @@ def decide_next_action(
     This is the main entry point for the deterministic planner.
     It returns a PlannerResult with the next action and any associated data.
 
-    Rules:
-    1. If client_action == CONFIRM => COMPLETE
-    2. If client_action == REJECT => ASK_QUESTION (ask for first missing or let user specify)
-    3. If asking for PHONE and user wants to search => FIND_PLACE
-    4. If all required slots filled => CONFIRM
-    5. Otherwise => ASK_QUESTION for next missing slot
+    Flow for phoneSource=PLACE agents (STOCK_CHECKER, RESTAURANT_RESERVATION, etc.):
+    1. Collect all required slots → ASK_QUESTION for each
+    2. All slots filled → CONFIRM (show confirmation card)
+    3. User taps CONFIRM → set _confirmed_core_details flag
+       - If place not resolved → FIND_PLACE (trigger place search)
+       - If place resolved → COMPLETE
+    4. After place selected (place_id + place_phone in slots) → COMPLETE directly
+       (no second confirmation card)
+
+    Flow for phoneSource=DIRECT_SLOT agents (SICK_CALLER):
+    1. Collect all required slots → ASK_QUESTION for each
+    2. All slots filled → CONFIRM
+    3. User taps CONFIRM → COMPLETE
+
+    Other rules:
+    - If client_action == REJECT → ASK_QUESTION (let user edit)
+    - If asking for PHONE and user says "don't know" → FIND_PLACE
 
     Args:
         spec: The agent specification
@@ -352,8 +499,22 @@ def decide_next_action(
     Returns:
         PlannerResult with the decision and associated data
     """
-    # Rule 1: CONFIRM action => COMPLETE
+    # Rule 1: CONFIRM action handling
     if client_action == ClientAction.CONFIRM.value or client_action == "CONFIRM":
+        # For PLACE agents, check if place is resolved
+        if spec.phone_source == PhoneSource.PLACE and not is_place_resolved(slots):
+            # User confirmed details but place not selected yet
+            # Set the confirmed flag and trigger place search
+            logger.info(f"Planner: client_action=CONFIRM, place not resolved => FIND_PLACE")
+            place_params = build_place_search_params(spec, slots)
+            return PlannerResult(
+                next_action=NextAction.FIND_PLACE,
+                place_search_params=place_params,
+                assistant_message="Great! Now let's find the store to call.",
+                # Note: The flag will be set in extractedData by conversation_v2
+            )
+
+        # Place resolved or not a PLACE agent => COMPLETE
         logger.info(f"Planner: client_action=CONFIRM => COMPLETE")
         return PlannerResult(
             next_action=NextAction.COMPLETE,
@@ -384,7 +545,7 @@ def decide_next_action(
     if current_question_slot:
         current_slot_spec = spec.get_slot_by_name(current_question_slot)
 
-    # Rule 3: Check for FIND_PLACE trigger (only for PHONE slots)
+    # Rule 3: Check for FIND_PLACE trigger (only for PHONE slots when user says "don't know")
     if should_trigger_find_place(user_message, current_slot_spec):
         logger.info(f"Planner: FIND_PLACE triggered by user message")
         place_params = build_place_search_params(spec, slots)
@@ -398,7 +559,28 @@ def decide_next_action(
     next_slot = get_next_slot(spec, slots)
 
     if next_slot is None:
-        # All required slots filled => CONFIRM
+        # All required slots filled
+        # For PLACE agents: check if user already confirmed and place is now resolved
+        if spec.phone_source == PhoneSource.PLACE:
+            if has_confirmed_details(slots) and is_place_resolved(slots):
+                # User already confirmed, place is now selected => go directly to COMPLETE
+                logger.info(f"Planner: All slots filled, details confirmed, place resolved => COMPLETE")
+                return PlannerResult(
+                    next_action=NextAction.COMPLETE,
+                    assistant_message="Great! I'll place the call now.",
+                )
+            elif has_confirmed_details(slots) and not is_place_resolved(slots):
+                # User confirmed but place not resolved (shouldn't happen normally, but handle it)
+                logger.info(f"Planner: Details confirmed but place not resolved => FIND_PLACE")
+                place_params = build_place_search_params(spec, slots)
+                return PlannerResult(
+                    next_action=NextAction.FIND_PLACE,
+                    place_search_params=place_params,
+                    assistant_message="Now let's find the store to call.",
+                )
+
+        # Normal case: show confirmation card
+        # (For PLACE agents without confirmed flag, or for DIRECT_SLOT agents)
         logger.info(f"Planner: All required slots filled => CONFIRM")
         confirmation_card = build_confirmation_card(spec, slots)
         return PlannerResult(

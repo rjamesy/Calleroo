@@ -51,7 +51,19 @@ def compute_missing_required_fields(
     """
     Deterministically compute which required fields are missing.
     This does NOT call OpenAI - it's pure logic.
+
+    Uses AgentSpec for the required slots definition, with legacy fallback.
     """
+    # Try to use AgentSpec (new approach)
+    try:
+        from backend_v2.agents import get_agent_spec
+        from backend_v2.engine.planner import get_missing_required_slots
+        spec = get_agent_spec(agent_type)
+        return get_missing_required_slots(spec, slots)
+    except (ImportError, ValueError):
+        # Fallback to legacy logic
+        pass
+
     missing: List[str] = []
 
     if agent_type == "STOCK_CHECKER":

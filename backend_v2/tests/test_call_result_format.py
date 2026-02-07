@@ -17,11 +17,21 @@ os.environ["OPENAI_API_KEY"] = "test-key-for-testing"
 os.environ["OPENAI_MODEL"] = "gpt-4o-mini"
 
 from app.main import app
+import app.main as main_module
+from app.call_result_service import get_call_result_service
 
 
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def init_services():
+    """Initialize services before each test (normally done in lifespan)."""
+    main_module.call_result_service = get_call_result_service()
+    yield
+    main_module.call_result_service = None
 
 
 @pytest.fixture

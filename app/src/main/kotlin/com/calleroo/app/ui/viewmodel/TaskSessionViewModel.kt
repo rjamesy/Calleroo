@@ -8,6 +8,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import javax.inject.Inject
@@ -65,12 +66,36 @@ class TaskSessionViewModel @Inject constructor() : ViewModel() {
     }
 
     /**
-     * Update slots with new data from Chat screen.
-     * Called after each /conversation/next response merges extractedData.
+     * Update slots by MERGING new data onto existing slots.
+     * Called after each /conversation/next response.
+     *
+     * CRITICAL FIX: This now MERGES instead of REPLACES to prevent slot loss.
+     * - Existing slots are preserved
+     * - New slots overlay existing (same key = overwrite)
+     * - Keys missing from newSlots are NOT deleted
      */
     fun updateSlots(newSlots: JsonObject) {
-        Log.d(TAG, "updateSlots: keys=${newSlots.keys}, conversationId=$conversationId")
-        _slots.value = newSlots
+        val existing = _slots.value
+        val merged = mergeJsonObjects(existing, newSlots)
+        Log.d(TAG, "updateSlots: existing=${existing.keys}, incoming=${newSlots.keys}, merged=${merged.keys}, conversationId=$conversationId")
+        _slots.value = merged
+    }
+
+    /**
+     * Merge two JsonObjects: copies all keys from existing, then overlays with incoming.
+     * Never deletes keys that are present in existing but missing from incoming.
+     */
+    private fun mergeJsonObjects(existing: JsonObject, incoming: JsonObject): JsonObject {
+        return buildJsonObject {
+            // Copy all existing keys
+            existing.forEach { (key, value) ->
+                put(key, value)
+            }
+            // Overlay with incoming keys (overwrites if key exists)
+            incoming.forEach { (key, value) ->
+                put(key, value)
+            }
+        }
     }
 
     /**

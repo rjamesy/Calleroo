@@ -67,16 +67,15 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.calleroo.app.domain.model.AgentType
-import com.calleroo.app.domain.model.Choice
 import com.calleroo.app.domain.model.ConfirmationCard
 import com.calleroo.app.domain.model.InputType
 import com.calleroo.app.domain.model.NextAction
 import com.calleroo.app.domain.model.Question
+import com.calleroo.app.domain.model.QuickReply
 import com.calleroo.app.domain.model.ResolvedPlace
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
 import com.calleroo.app.util.PhoneUtils
-import com.calleroo.app.util.UnifiedConversationGuard
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.jsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -105,9 +104,11 @@ fun UnifiedChatScreen(
     }
 
     // ✅ FIX 2: Continuous slot sync (no missed updates under load)
+    // CRITICAL: Use collect (NOT collectLatest) to ensure every emission is processed.
+    // collectLatest can drop intermediate emissions under rapid updates, causing slot loss.
     LaunchedEffect(Unit) {
         snapshotFlow { uiState.slots }
-            .collectLatest { slots ->
+            .collect { slots ->
                 taskSession.updateSlots(slots)
             }
     }
@@ -149,25 +150,31 @@ fun UnifiedChatScreen(
     }
 
     // Navigate to Call Summary when Continue button is clicked (for COMPLETE)
-    // For direct-phone agents (SICK_CALLER), synthesize ResolvedPlace from slots
+    // For DIRECT_SLOT phone source, synthesize ResolvedPlace from slots using agentMeta
     LaunchedEffect(navigateToCallSummary) {
         if (navigateToCallSummary) {
             viewModel.clearNavigateToCallSummary()
 
-            if (agentType == AgentType.SICK_CALLER) {
+            val agentMeta = uiState.agentMeta
+            val phoneSource = agentMeta?.phoneSource ?: "PLACE"
+            val directPhoneSlot = agentMeta?.directPhoneSlot
+
+            if (phoneSource == "DIRECT_SLOT" && directPhoneSlot != null) {
+                // Direct phone source: synthesize ResolvedPlace from slot
                 val slots = uiState.slots
 
-                val employerName = slots["employer_name"]?.jsonPrimitive?.content
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "Work"
+                // Get business name from first slot or use agent title
+                val businessName = slots.keys.firstOrNull()?.let { firstSlot ->
+                    slots[firstSlot]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() }
+                } ?: agentMeta.title.ifBlank { "Business" }
 
-                val rawPhone = slots["employer_phone"]?.jsonPrimitive?.content ?: ""
+                val rawPhone = slots[directPhoneSlot]?.jsonPrimitive?.content ?: ""
                 val phoneE164 = PhoneUtils.toE164(rawPhone)
 
                 if (phoneE164 != null) {
                     val manualPlace = ResolvedPlace(
-                        placeId = "manual:sick_caller:${conversationId}",
-                        businessName = employerName,
+                        placeId = "manual:${agentType.name.lowercase()}:${conversationId}",
+                        businessName = businessName,
                         formattedAddress = null,
                         phoneE164 = phoneE164
                     )
@@ -175,10 +182,11 @@ fun UnifiedChatScreen(
                     onNavigateToCallSummary()
                 } else {
                     snackbarHostState.showSnackbar(
-                        "Invalid phone number. Please check the employer phone and try again."
+                        "Invalid phone number. Please check and try again."
                     )
                 }
             } else {
+                // PLACE phone source: proceed to CallSummary (place already resolved)
                 onNavigateToCallSummary()
             }
         }
@@ -255,8 +263,11 @@ fun UnifiedChatScreen(
             if (uiState.showContinueButton) {
                 ContinueButton(
                     onClick = {
-                        // FIX 3: Handle SICK_CALLER directly (no PlaceSearch step)
-                        if (agentType == AgentType.SICK_CALLER) {
+                        // Generic handling based on agentMeta.phoneSource
+                        // DIRECT_SLOT: Navigate to CallSummary directly (no PlaceSearch)
+                        // PLACE: Navigate to PlaceSearch first
+                        val phoneSource = uiState.agentMeta?.phoneSource ?: "PLACE"
+                        if (phoneSource == "DIRECT_SLOT") {
                             // Sync slots before navigation
                             taskSession.updateSlots(uiState.slots)
                             viewModel.triggerNavigateToCallSummary()
@@ -267,25 +278,20 @@ fun UnifiedChatScreen(
                 )
             }
 
+            // Use quickReplies generically (handles CHOICE, YES_NO, and legacy choices)
             val currentQuestion = uiState.currentQuestion
-            val choices = currentQuestion?.choices
-            if (!choices.isNullOrEmpty() && !uiState.showConfirmationCard && !uiState.showContinueButton) {
-                UnifiedConversationGuard.assertChoicesFromBackend(
-                    choices = choices,
-                    backendProvided = true
-                )
-
-                ChoiceChips(
-                    choices = choices,
-                    onChoiceSelected = { choice ->
-                        // FIX 1: Persist CHOICE locally before sending to backend
-                        // This ensures slots like reason_category are saved immediately
+            val quickReplies = currentQuestion?.getEffectiveQuickReplies()
+            if (!quickReplies.isNullOrEmpty() && !uiState.showConfirmationCard && !uiState.showContinueButton) {
+                QuickReplyChips(
+                    quickReplies = quickReplies,
+                    onQuickReplySelected = { quickReply ->
+                        // Persist locally before sending to backend
                         val field = uiState.currentQuestion?.field
                         if (!field.isNullOrBlank()) {
-                            viewModel.injectSlot(field, choice.value)
+                            viewModel.injectSlot(field, quickReply.value)
                         }
 
-                        viewModel.sendMessage(choice.value)
+                        viewModel.sendMessage(quickReply.value)
                     },
                     enabled = !uiState.isLoading
                 )
@@ -479,11 +485,14 @@ private fun ContinueButton(onClick: () -> Unit) {
     }
 }
 
+/**
+ * Generic quick reply chips - handles CHOICE, YES_NO, and any other quickReplies.
+ */
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
-private fun ChoiceChips(
-    choices: List<Choice>,
-    onChoiceSelected: (Choice) -> Unit,
+private fun QuickReplyChips(
+    quickReplies: List<QuickReply>,
+    onQuickReplySelected: (QuickReply) -> Unit,
     enabled: Boolean
 ) {
     FlowRow(
@@ -493,12 +502,12 @@ private fun ChoiceChips(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        choices.forEach { choice ->
+        quickReplies.forEach { quickReply ->
             FilterChip(
                 selected = false,
-                onClick = { onChoiceSelected(choice) },
+                onClick = { onQuickReplySelected(quickReply) },
                 enabled = enabled,
-                label = { Text(choice.label) },
+                label = { Text(quickReply.label) },
                 colors = FilterChipDefaults.filterChipColors(
                     containerColor = MaterialTheme.colorScheme.surfaceVariant,
                     labelColor = MaterialTheme.colorScheme.onSurfaceVariant

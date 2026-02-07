@@ -54,6 +54,11 @@ class SlotSpec:
         validators: Optional list of validator function names
         normalizers: Optional list of normalizer function names
         description: Human-readable description for debugging
+        ask_if: Optional predicate function that takes slots dict and returns bool.
+                If provided, this slot is only asked when ask_if(slots) returns True.
+                Used for conditional/contextual slots.
+        required_if: Optional predicate function that makes this slot conditionally required.
+                     If required_if(slots) returns True, this slot is treated as required.
     """
     name: str
     required: bool
@@ -63,6 +68,8 @@ class SlotSpec:
     validators: Optional[List[str]] = None
     normalizers: Optional[List[str]] = None
     description: Optional[str] = None
+    ask_if: Optional[Callable[[Dict[str, Any]], bool]] = None
+    required_if: Optional[Callable[[Dict[str, Any]], bool]] = None
 
     def get_quick_replies(self) -> Optional[List[Dict[str, str]]]:
         """
@@ -77,6 +84,34 @@ class SlotSpec:
                 {"label": "No", "value": "NO"},
             ]
         return None
+
+    def should_ask(self, slots: Dict[str, Any]) -> bool:
+        """
+        Determine if this slot should be asked.
+
+        Required if:
+        - required == True
+        - OR required_if(slots) == True
+
+        Optional if:
+        - ask_if(slots) == True
+
+        Args:
+            slots: Current slot values
+
+        Returns:
+            True if this slot should be asked
+        """
+        # Check if conditionally required now
+        is_required_now = self.required or (self.required_if is not None and self.required_if(slots))
+        if is_required_now:
+            return True
+
+        # Check optional ask_if predicate
+        if self.ask_if is not None:
+            return self.ask_if(slots)
+
+        return False
 
 
 @dataclass
@@ -144,6 +179,160 @@ class AgentSpec:
     def get_required_slot_names(self) -> List[str]:
         """Get required slot names in order."""
         return [s.name for s in self.slots_in_order if s.required]
+
+
+# =============================================================================
+# CONDITIONAL SLOT PREDICATES
+# =============================================================================
+
+# Category-only terms that are too generic for stock checks
+GENERIC_PRODUCT_TERMS = {
+    "fishing rod", "rod", "rods", "fishing reel", "reel", "reels",
+    "shoes", "shoe", "sneakers", "boots", "sandals",
+    "laptop", "laptops", "computer", "computers", "pc",
+    "phone", "phones", "mobile", "mobiles", "smartphone",
+    "tv", "television", "televisions", "monitor", "monitors",
+    "headphones", "earbuds", "earphones", "speaker", "speakers",
+    "camera", "cameras", "lens", "lenses",
+    "printer", "printers", "keyboard", "keyboards", "mouse",
+    "towel", "towels", "sheets", "sheet", "pillow", "pillows",
+    "chair", "chairs", "table", "tables", "desk", "desks",
+    "lamp", "lamps", "light", "lights", "bulb", "bulbs",
+    "tool", "tools", "drill", "drills", "saw", "saws",
+    "paint", "paints", "brush", "brushes",
+    "garden hose", "hose", "hoses", "shovel", "rake",
+    "bike", "bikes", "bicycle", "bicycles",
+    "tent", "tents", "camping gear", "sleeping bag",
+    "jacket", "jackets", "coat", "coats", "shirt", "shirts",
+    "pants", "jeans", "shorts", "dress", "dresses",
+}
+
+
+def is_generic_product_name(product_name: Optional[str]) -> bool:
+    """
+    Check if a product name is too generic and needs more details.
+
+    A product name is considered generic if:
+    - It's None or empty
+    - It has 2 or fewer words
+    - It matches a known generic category term
+
+    Args:
+        product_name: The product name to check
+
+    Returns:
+        True if the product name is generic and needs more details
+    """
+    if not product_name:
+        return True
+
+    name_lower = product_name.strip().lower()
+    if not name_lower:
+        return True
+
+    # Check against known generic terms
+    if name_lower in GENERIC_PRODUCT_TERMS:
+        return True
+
+    # Check word count - 2 or fewer words is likely generic
+    words = name_lower.split()
+    if len(words) <= 2:
+        return True
+
+    return False
+
+
+def is_generic_product(slots: Dict[str, Any]) -> bool:
+    """
+    Check if the current product_name in slots is generic.
+
+    A product is generic if:
+    - It's in GENERIC_PRODUCT_TERMS, OR
+    - It has 2 or fewer words
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if product is generic
+    """
+    name = (slots.get("product_name") or "").strip().lower()
+    if not name:
+        return False
+    # Check if it's a known generic term
+    if name in GENERIC_PRODUCT_TERMS:
+        return True
+    # Short names (2 words or less) are considered generic
+    if len(name.split()) <= 2:
+        return True
+    return False
+
+
+def needs_product_details(slots: Dict[str, Any]) -> bool:
+    """
+    Check if product_details is required (conditionally).
+
+    Required when:
+    - Product is generic
+    - User hasn't said broad_ok=YES
+    - Details are empty or "not sure"
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if product_details should be required
+    """
+    if not is_generic_product(slots):
+        return False
+    broad_ok = (slots.get("broad_ok") or "").strip().upper()
+    if broad_ok == "YES":
+        return False
+    details = (slots.get("product_details") or "").strip().lower()
+    if details in ("", "not sure", "not_sure", "unsure", "skip"):
+        return True
+    return False
+
+
+def needs_broad_ok(slots: Dict[str, Any]) -> bool:
+    """
+    Check if broad_ok confirmation is required.
+
+    Required when:
+    - Product is generic
+    - User said "not sure" for product_details
+    - broad_ok hasn't been answered yet
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if broad_ok should be required
+    """
+    if not is_generic_product(slots):
+        return False
+    details = (slots.get("product_details") or "").strip().lower()
+    if details in ("not sure", "not_sure", "unsure", "skip", ""):
+        # Only ask if not already answered
+        broad_ok_val = slots.get("broad_ok")
+        return broad_ok_val is None or str(broad_ok_val).strip() == ""
+    return False
+
+
+def should_ask_product_details(slots: Dict[str, Any]) -> bool:
+    """
+    Predicate for product_details slot (ask_if).
+
+    Only ask for product details if the product_name is generic.
+
+    Args:
+        slots: Current slot values
+
+    Returns:
+        True if we should ask for product details
+    """
+    product_name = slots.get("product_name")
+    return is_generic_product_name(product_name)
 
 
 # =============================================================================
@@ -226,7 +415,10 @@ SICK_CALLER_SPEC = AgentSpec(
         "Phone: {employer_phone}",
         "Your name: {caller_name}",
         "Shift: {shift_date} at {shift_start_time}",
+        # IMPORTANT: render the LABEL (e.g. "I'm sick") in your UI/template, not the raw enum value
         "Reason: {reason_category}",
+        "Return: {expected_return_date}",  # show only if present in UI
+        "Note: {note_for_team}",           # show only if present in UI
     ],
 
     phone_source=PhoneSource.DIRECT_SLOT,
@@ -234,17 +426,28 @@ SICK_CALLER_SPEC = AgentSpec(
 
     phone_flow=PhoneFlow(
         mode=PhoneFlowMode.DETERMINISTIC_SCRIPT,
-        greeting_template="Hi, this is an automated call on behalf of {caller_name}.",
+
+        # Keep greeting short and natural
+        greeting_template="Hi—I'm Calleroo, the mobile app, calling on behalf of {caller_name}.",
+
+        # IMPORTANT IMPLEMENTATION NOTES:
+        # - Use the reason_category *LABEL* (or a mapped spoken phrase) when filling {reason_spoken}
+        # - expected_return_sentence/note_sentence should resolve to "" if not provided
+        # - Do NOT ask "Did you receive this message?" (sounds robotic)
         message_template=(
-            "{caller_name} won't be able to make their shift on {shift_date} at {shift_start_time}. "
-            "The reason is {reason_category}. Could you please confirm you've received this message?"
+            "{caller_name} won’t be able to make their shift on {shift_date} at {shift_start_time}. "
+            "{reason_spoken} "
+            "{expected_return_sentence}"
+            "{note_sentence}"
+            "Thanks for your help."
         ),
     ),
 
     objective_template="Notify {employer_name} that {caller_name} cannot attend their shift on {shift_date}",
     script_template=(
         "Call {employer_name} at {employer_phone} to notify them that {caller_name} "
-        "cannot attend their shift on {shift_date} at {shift_start_time} due to {reason_category}."
+        "cannot attend their shift on {shift_date} at {shift_start_time}. "
+        "Reason: {reason_category}."
     ),
 )
 
@@ -268,6 +471,22 @@ STOCK_CHECKER_SPEC = AgentSpec(
             input_type=InputType.TEXT,
             prompt="What product are you looking for?",
             description="Product to check availability"
+        ),
+        SlotSpec(
+            name="product_details",
+            required=False,
+            required_if=needs_product_details,  # Conditionally required for generic products
+            input_type=InputType.TEXT,
+            prompt="Do you know the brand/model or key specs (size/voltage/type)? If not, say 'not sure'.",
+            description="Brand/model/details for generic products",
+        ),
+        SlotSpec(
+            name="broad_ok",
+            required=False,
+            required_if=needs_broad_ok,  # Required when product is generic and details are "not sure"
+            input_type=InputType.YES_NO,
+            prompt="This is pretty broad, so the store may ask for more detail. Do you still want me to call and ask generally?",
+            description="User approval to proceed with generic product",
         ),
         SlotSpec(
             name="quantity",
@@ -310,6 +529,7 @@ STOCK_CHECKER_SPEC = AgentSpec(
     confirm_lines=[
         "Retailer: {retailer_name}",
         "Product: {product_name}",
+        "Details: {product_details}",
         "Quantity: {quantity}",
         "Location: {store_location}",
     ],
@@ -320,10 +540,15 @@ STOCK_CHECKER_SPEC = AgentSpec(
 
     phone_flow=PhoneFlow(
         mode=PhoneFlowMode.LLM_DIALOG,
+        greeting_template="Hi—I'm Calleroo, the mobile app, calling on behalf of a customer.",
         system_prompt_template=(
-            "You are calling {retailer_name} to check if they have {product_name} in stock. "
-            "The customer needs {quantity} units. Be polite, identify yourself as an AI assistant, "
-            "and ask about availability. If out of stock, ask about ETA or nearby stores."
+            "You are calling {retailer_name} to check stock for a customer.\n"
+            "Item: {product_name}.\n"
+            "Details (if provided): {product_details}.\n"
+            "Quantity needed: {quantity}.\n\n"
+            "Be polite and practical. Identify yourself as Calleroo (an AI assistant from a mobile app) calling on behalf of the customer.\n"
+            "Say the full item name once, then refer to it as 'the item' or 'this item' (do not keep repeating the full name).\n"
+            "Ask if it's in stock. If not, ask ETA (only if enabled) or nearest store (only if enabled).\n"
         ),
     ),
 
